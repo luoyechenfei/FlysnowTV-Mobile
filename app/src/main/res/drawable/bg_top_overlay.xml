@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 顶部悬浮菜单背景：顶部不透明深蓝（遮住滑到其下方的卡片，实现「被遮住自动隐藏」），
+     底部渐变到透明，让卡片从菜单下缘自然浮现，不与频道墙割裂。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:angle="270"
+        android:startColor="#F61D58A6"
+        android:centerColor="#E8103474"
+        android:centerY="0.62"
+        android:endColor="#00103474" />
+</shape>

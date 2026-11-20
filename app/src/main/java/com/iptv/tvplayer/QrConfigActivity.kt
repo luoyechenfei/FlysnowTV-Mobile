@@ -1,0 +1,112 @@
+package com.iptv.tvplayer
+
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.os.Bundle
+import android.view.KeyEvent
+import android.widget.ImageView
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.MultiFormatWriter
+import com.google.zxing.common.BitMatrix
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+
+/**
+ * 手机扫码配置页：在盒子上启动局域网配置服务，把地址生成二维码。
+ * 手机扫码后打开内嵌网页，填接口 / 设置并保存，电视端 SharedPreferences 立即更新。
+ */
+class QrConfigActivity : AppCompatActivity() {
+
+    companion object {
+        /** 传入 MODE_LOGS 时二维码指向日志分享页，而不是配置首页 */
+        const val EXTRA_MODE = "mode"
+        const val MODE_LOGS = "logs"
+    }
+
+    private lateinit var server: WebConfigServer
+    private lateinit var statusView: TextView
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_qr)
+
+        // 返回按钮：左上角浮层，退出时 onDestroy 会自动关闭配置服务
+        findViewById<TextView>(R.id.btnBack).setOnClickListener { finish() }
+
+        val pinView = findViewById<TextView>(R.id.qrPin)
+        val urlView = findViewById<TextView>(R.id.qrUrl)
+        statusView = findViewById(R.id.qrStatus)
+        val qrImage = findViewById<ImageView>(R.id.qrImage)
+
+        val pin = (1000..9999).random().toString()
+        Prefs(this).webPin = pin
+        pinView.text = pin
+
+        val ip = WebConfigServer.localIp()
+        val logsMode = intent.getStringExtra(EXTRA_MODE) == MODE_LOGS
+        val page = if (logsMode) "/log" else "/"
+        val url = "http://$ip:${Prefs.WEB_CONFIG_PORT}$page?pin=$pin"
+        urlView.text = url
+
+        if (logsMode) {
+            findViewById<TextView>(R.id.qrTitle).text = "手机扫码取日志"
+            findViewById<TextView>(R.id.qrSubtitle).text =
+                "扫码后在手机上复制 / 下载日志，再用微信或 QQ 发送"
+            findViewById<TextView>(R.id.qrSteps).text =
+                "1　手机与盒子连同一个 WiFi\n" +
+                    "2　用相机 / 微信扫左侧二维码\n" +
+                    "3　手机点「分享 / 复制 / 下载 .txt」\n" +
+                    "4　发到微信或 QQ；按 BACK 返回即关闭服务"
+            qrImage.contentDescription = "日志分享页二维码"
+            statusView.text = "日志已生成，等待手机扫码取回"
+        }
+
+        val bitmap = makeQrCode(url)
+        if (bitmap != null) {
+            qrImage.setImageBitmap(bitmap)
+        } else {
+            statusView.text = "二维码生成失败，可在手机浏览器直接输入上面的地址"
+        }
+
+        server = WebConfigServer(this, pin) { message ->
+            statusView.text = message
+        }
+        server.start()
+    }
+
+    override fun onDestroy() {
+        if (::server.isInitialized) server.stop()
+        super.onDestroy()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            finish()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    private fun makeQrCode(content: String, size: Int = 620): Bitmap? = try {
+        val hints = HashMap<EncodeHintType, Any>()
+        hints[EncodeHintType.CHARACTER_SET] = "UTF-8"
+        hints[EncodeHintType.ERROR_CORRECTION] = ErrorCorrectionLevel.M
+        hints[EncodeHintType.MARGIN] = 1
+        val matrix: BitMatrix = MultiFormatWriter()
+            .encode(content, BarcodeFormat.QR_CODE, size, size, hints)
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(size * size)
+        for (y in 0 until size) {
+            val row = y * size
+            for (x in 0 until size) {
+                pixels[row + x] = if (matrix.get(x, y)) Color.BLACK else Color.WHITE
+            }
+        }
+        bitmap.setPixels(pixels, 0, size, 0, 0, size, size)
+        bitmap
+    } catch (ignored: Exception) {
+        null
+    }
+}

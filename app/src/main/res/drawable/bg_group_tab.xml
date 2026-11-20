@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 手机/平板顶部分类标签：Material 风格底部指示条。
+     选中态底部亮蓝横线 + 淡蓝底；未选中透明；无 TV 的胶囊描边。 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_selected="true">
+        <layer-list>
+            <item>
+                <shape android:shape="rectangle">
+                    <solid android:color="#142C5A9E" />
+                    <corners android:radius="8dp" />
+                </shape>
+            </item>
+            <item android:gravity="bottom" android:left="10dp" android:right="10dp" android:top="-2dp">
+                <shape android:shape="rectangle">
+                    <size android:height="3dp" />
+                    <solid android:color="@color/accent" />
+                    <corners android:radius="2dp" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@android:color/transparent" />
+        </shape>
+    </item>
+</selector>

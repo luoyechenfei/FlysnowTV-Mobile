@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 横滑分类标签文字：选中亮白，未选中半透明白 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:color="#FFFFFF" android:state_selected="true" />
+    <item android:color="#B9CCEA" />
+</selector>

@@ -1,0 +1,3549 @@
+package com.iptv.tvplayer
+
+import android.app.AlertDialog
+import android.content.Intent
+import android.content.res.ColorStateList
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.net.TrafficStats
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.Process
+import android.os.SystemClock
+import android.util.TypedValue
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewConfiguration
+import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.ProgressBar
+import android.widget.TextView
+import android.widget.Toast
+import androidx.annotation.OptIn
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.ui.PlayerView
+import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import coil.imageLoader
+import coil.request.ErrorResult
+import coil.request.ImageRequest
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+/**
+ * 飞雪TV 主界面：深色海报墙 + 全屏播放双模式。
+ *
+ * 墙面：分组筛选（含收藏 / 最近观看）、卡片内低码率静音预览、长按 OK 收藏。
+ * 播放：全屏画面 + 信息浮层，OK 呼出 XMLTV 节目单，BACK 回墙面但声音继续。
+ */
+@OptIn(UnstableApi::class)
+class MainActivity : AppCompatActivity() {
+
+    companion object {
+        private const val MODE_WALL = 0
+        private const val MODE_PLAYER = 1
+
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 12; Android TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        /** 换台 / 手动 MENU 呼出的右上信息卡、底部信息栏统一 5 秒后一起收起 */
+        private const val INFO_HIDE_DELAY = 5000L
+        /** 实时网速采样间隔（毫秒） */
+        private const val NET_SPEED_INTERVAL = 1000L
+        /** 频道墙每页行数下限/上限：手机版按屏幕方向自适应，TV 版固定 3 行 */
+        private const val MIN_PAGE_ROWS = 2
+        private const val MAX_PAGE_ROWS = 6
+        /** 连续缓冲超过 3 秒视为卡顿：手机移动网络分片抖动常见，2 秒过于敏感会误判切源 */
+        private const val STALL_SWITCH_DELAY = 3000L
+        /** 两档降级之间的冷却：留 4 秒观察降档后能否恢复 */
+        private const val STALL_DOWNGRADE_COOLDOWN = 4_000L
+        /** 两次卡顿换源之间的冷却，避免网络抖动时来回切 */
+        private const val STALL_SWITCH_COOLDOWN = 15_000L
+        /** 单线路「回到直播边缘重连」的独立冷却：没有可换的源，不该被 15 秒换源冷却卡住 */
+        private const val STALL_RECONNECT_COOLDOWN = 4_000L
+        private const val NUMBER_TIMEOUT = 2500L
+        private const val NUMBER_MAX_DIGITS = 4
+        /** 长按 MENU 超过 3 秒才进设置中心；短按只呼出底部信息栏 */
+        private const val MENU_LONG_PRESS_MS = 3000L
+        private val PROGRESSIVE_EXTENSIONS = listOf(
+            ".mp4", ".ts", ".mkv", ".flv", ".mov", ".avi", ".wmv", ".m4v", ".3gp",
+            ".webm", ".ogv", ".mpg", ".mpeg", ".m2ts", ".rmvb", ".rm", ".f4v"
+        )
+        private const val PREVIEW_DELAY = 700L
+        private const val TICK_INTERVAL = 60_000L
+        private const val EPG_CHECK_INTERVAL = 5 * 60_000L
+        private const val REQUEST_EPG_GRID = 1201
+    }
+
+    // 墙面
+    private lateinit var wallLayer: View
+    private lateinit var wallHeader: View
+    private lateinit var wallTopOverlay: View
+    private lateinit var gridView: RecyclerView
+    private lateinit var groupListView: RecyclerView
+    // 滑动频道时自动隐藏顶部浮层（分类/设置/logo），停手后恢复，放大观看视野。
+    // 浮层是覆盖在网格之上的独立层：显隐只改透明度，网格位置/尺寸恒定不动。
+    private var wallHeaderHidden = false
+    private val showWallHeaderRunnable = Runnable { setWallHeaderHidden(false) }
+    private lateinit var countView: TextView
+    private lateinit var nowPlayingChip: TextView
+    private lateinit var sourceLabelView: TextView
+    private lateinit var emptyHint: TextView
+
+    // 频道首行：分页条 / 最近观看管理条（等高互斥，保证 3 行卡片不被遮挡）
+    private lateinit var pagerBar: View
+    private lateinit var selectionBar: View
+    private lateinit var btnPrevPage: View
+    private lateinit var btnNextPage: View
+    private lateinit var btnManageRecent: View
+    private lateinit var pageInfoView: TextView
+    private lateinit var pageRangeView: TextView
+    private lateinit var selCountView: TextView
+    private lateinit var btnSelAll: View
+    private lateinit var btnSelInvert: View
+    private lateinit var btnSelDelete: TextView
+    private lateinit var btnSelCancel: View
+    private lateinit var btnSelPrev: View
+    private lateinit var btnSelNext: View
+
+    /** 当前筛选结果的完整列表；每页只把当前 pageRows 行切片提交给 Adapter */
+    private var filteredChannels: List<Channel> = emptyList()
+    private var spanCount = 5
+    /** 每页行数：TV 版固定 3，手机版按屏幕宽高/方向自适应 */
+    private var pageRows = 3
+    /** 是否已在 layout 回调里按真实高度确定过行数（避免重复重排导致抖动） */
+    private var pageRowsResolved = false
+    private var currentPage = 0
+
+    // 播放层
+    private lateinit var playerView: PlayerView
+    private lateinit var statusView: TextView
+    private lateinit var hintView: TextView
+    private lateinit var loadingView: ProgressBar
+    private lateinit var errorView: TextView
+
+    private lateinit var player: ExoPlayer
+    private lateinit var httpFactory: OkHttpDataSource.Factory
+    private lateinit var dataSourceFactory: DefaultDataSource.Factory
+    private lateinit var trackSelector: DefaultTrackSelector
+    private lateinit var channelAdapter: ChannelAdapter
+
+    /** 手机 / 平板触摸手势（TV 版无此项）：只在播放态响应，回调复用既有逻辑 */
+    private lateinit var touchGestures: TouchGestures
+
+    /** 预览播放器按需创建：绝大多数盒子不该存在第二路解码器 */
+    private var previewPlayer: ExoPlayer? = null
+
+    /** 全局唯一的预览 surface，聚焦时挂到对应卡片的 previewHost */
+    private var previewSurface: PlayerView? = null
+    private var previewFailures = 0
+
+    /** 收敛后台网络任务，避免每次刷新都新建 Thread */
+    private val ioExecutor: ExecutorService = Executors.newFixedThreadPool(2)
+
+    @Volatile
+    private var epgLoading = false
+    private var lastEpgAttempt = 0L
+    private var lastEpgErrorShown: String? = null
+    private lateinit var groupAdapter: GroupAdapter
+    private lateinit var repository: PlaylistRepository
+    private lateinit var tokens: TokenManager
+    private lateinit var epg: EpgRepository
+    private lateinit var prefs: Prefs
+    private lateinit var settingsButton: View
+
+    private val handler = Handler(Looper.getMainLooper())
+
+    private var allChannels: List<Channel> = emptyList()
+    private var currentChannel: Channel? = null
+    /** 冷启动自动播放上次频道只做一次：换源 / 设置返回导致的重新拉源不再重播 */
+    private var autoPlayedOnLaunch = false
+    private var activeGroup: String? = null
+    /** 用户是否手动选过分组：手动选过之后重新拉源不再强行跳回默认分类 */
+    private var userPickedGroup = false
+
+    private var lastLogoMode = -1
+    private var currentLineIndex = 0
+    private var lineSwitches = 0
+    private var linePickerOpen = false
+    /** 卡顿自动降级 / 切源：上次触发时间、检查是否已排队、缓冲检查任务 */
+    private var lastStallSwitchMs = 0L
+    private var lastStallDowngradeMs = 0L
+    private var lastStallReconnectMs = 0L
+    /** 每次 preparePlayback 递增：延时切线路回调必须校验会话，否则换台后会切到新频道 */
+    private var playbackGeneration = 0L
+    private var pendingAutoLineSwitch: Runnable? = null
+    private var stallCheckPending = false
+    private val stallCheckRunnable = Runnable { onPlaybackStalled() }
+    /** 实时网速有效样本数（起播后至少 2 个样本才参与清晰度决策） */
+    private var netSpeedSamples = 0
+    /** 按实时网速动态设定的视频码率上限；-1 表示尚未设定 */
+    private var adaptiveBitrateCap = -1
+    /** 升档需连续稳定若干秒，降档立即生效，避免轨道反复横跳 */
+    private var adaptiveUpgradeSamples = 0
+    /** 卡顿降档后的升档抑制截止时刻（elapsedRealtime） */
+    private var adaptiveUpgradeHoldUntil = 0L
+    private var timeshiftStart: Long? = null
+    private var lastReminderKey: String? = null
+    private var reservationTarget: String? = null
+    private var playbackFailures = 0
+    private var externalFallbackTried = false
+
+    /** 因「音轨设备解不了」而切换线路的次数（与播放失败计数分开，避免来回死切） */
+    private var audioSwitches = 0
+    private var audioUnsupportedNotified = false
+    private var audioSwitchPending = false
+
+    /** 每个频道累计的播放失败次数，达到阈值（且开启过滤）后自动隐藏该频道 */
+    private val channelFailures = HashMap<String, Int>()
+
+    /** 已自动隐藏（播放失败）的频道稳定标识快照，用于 applyFilter 过滤，避免每次重建集合 */
+    private var hiddenSnapshot: Set<String> = emptySet()
+
+    private var mode = MODE_WALL
+    private var numberBuffer = ""
+    /** 数字选台输入浮层：正在输入的台号、匹配到的频道 */
+    private lateinit var numberInputCard: View
+    private lateinit var numberInputDigitsView: TextView
+    private lateinit var numberInputMatchView: TextView
+    /** 同一轮播放错误只排一次自动切线路，避免多个 postDelayed 叠加反复起播 */
+    private var switchLinePending = false
+    /** 上一次的「内置 / 外部」引擎状态（-1 未初始化、0 内置、1 外部），用于切换时即时重播 */
+    private var lastEngineMode = -1
+    private var loadingSource = false
+    private var userPaused = false
+    private var pendingReload = false
+    private var fastBufferMode = false
+    private var lastSettingsVersion = 0L
+    private var lastCoverMode = -1
+    private var currentResolution: String? = null
+    private var lastTokenRefresh = 0L
+
+    // 卡片预览
+    private var activePreviewHost: FrameLayout? = null
+    private var activePreviewUrl: String? = null
+    private var previewRunnable: Runnable? = null
+    /** 正在排队等待启动的预览宿主：鼠标 HOVER_MOVE 每帧回调都不能重新计时 */
+    private var pendingPreviewHost: FrameLayout? = null
+    /** 鼠标/飞鼠实际悬停的卡片；不依赖 ROM 的 View.isHovered（部分盒子实现不可靠） */
+    private var hoveredHost: FrameLayout? = null
+    /** 预览失败的线路：只跳过坏源，不因几个死链就把全局预览关掉 */
+    private val previewFailedUrls = HashSet<String>()
+    /** 当前预览的频道，失败时用来找备用线路继续出画面 */
+    private var previewChannel: Channel? = null
+    private var previewRetryPending = false
+
+    // 手机/平板标准播放器控制条（顶部返回/频道名/设置 + 底部播放控制）
+    private lateinit var playerControls: View
+    private lateinit var ctrlName: TextView
+    private lateinit var ctrlMeta: TextView
+    private lateinit var ctrlProgram: TextView
+    private lateinit var ctrlTime: TextView
+    private lateinit var ctrlDuration: TextView
+    private lateinit var ctrlProgress: ProgressBar
+    private lateinit var ctrlPlayPause: TextView
+
+    // 右上角唯一信息卡（手机版已停用：节点保留仅为兼容既有字段引用）
+    private lateinit var channelInfoCard: View
+    private lateinit var infoNumberView: TextView
+    private lateinit var infoNameView: TextView
+    private lateinit var infoMetaView: TextView
+    private lateinit var infoGroupView: TextView
+    private lateinit var infoProgramView: TextView
+    private lateinit var infoNextView: TextView
+    private lateinit var infoExtraView: TextView
+    private lateinit var infoTimeView: TextView
+    private lateinit var infoNetSpeedView: TextView
+    private lateinit var reservationCard: TextView
+
+    // 底部频道信息栏（半透明）：台标 / 线路 / 节目 / 进度 / 一排可直接切换当前画面的按钮
+    private lateinit var bottomInfoBar: View
+    private lateinit var bottomLogo: ImageView
+    private lateinit var bottomLogoLetter: TextView
+    private lateinit var bottomName: TextView
+    private lateinit var bottomMeta: TextView
+    private lateinit var bottomTime: TextView
+    private lateinit var bottomRange: TextView
+    private lateinit var bottomProgram: TextView
+    private lateinit var bottomProgress: ProgressBar
+    private lateinit var bottomProgressText: TextView
+    private lateinit var bottomNext: TextView
+    private lateinit var btnFav: TextView
+    private lateinit var btnGuide: TextView
+    private lateinit var btnLine: TextView
+    private lateinit var btnQuality: TextView
+    private lateinit var btnControl: TextView
+    private lateinit var btnEngine: TextView
+    private lateinit var btnSettings: TextView
+    private lateinit var btnClear: TextView
+
+    // 左侧节目单
+    private lateinit var epgPanel: View
+    private lateinit var epgListView: RecyclerView
+    private lateinit var epgTimeView: TextView
+    private lateinit var epgTitleView: TextView
+    private lateinit var epgDetailView: TextView
+    private lateinit var epgAdapter: EpgAdapter
+    private var epgVisible = false
+    private var epgIndex = 0
+
+    private val commitNumberRunnable = Runnable { commitNumber() }
+
+    // MENU 长短按：短按在 onKeyUp 里呼出底部信息栏，长按 3 秒才打开设置
+    private var menuLongPressFired = false
+    private val menuLongPressRunnable = Runnable {
+        menuLongPressFired = true
+        clearManualBottomMode()
+        toast("长按 MENU · 打开设置中心")
+        openSettings()
+    }
+
+    /** 手动按过 MENU：信息栏进入「遥控器操作模式」，上下左右都用于选功能。
+     *  换台等自动显示的信息栏不进入此模式，方向键仍是换台 / 切线路。 */
+    private var manualBottomMode = false
+    /** 手动模式下高亮的功能序号（进入模式时重设为「线路」），不依赖 Android View 焦点 */
+    private var bottomActionIndex = 0
+
+    /**
+     * 本次 OK 的 down 已被 Activity 消费。OK 的 up 必须一并吞掉：
+     * 否则 framework 会把抬键再转成一次对「当前持有焦点 View」的点击，
+     * 同一次 OK 就会执行两遍（例如先切线路、又弹出节目单 / 把 EPG 选台覆盖回原频道）。
+     */
+    private var consumedOkDown = false
+
+    /** 播放态短按 OK 等抬键才打开节目单；长按时撤销并改为收藏 */
+    private var pendingShowEpgOnOkUp = false
+
+    /** 节目单里短按 OK 也等抬键才换台：长按 OK 可直接撤销换收藏，节目单不会消失 */
+    private var pendingPickEpgOnOkUp = false
+
+    /** 本次 OK 长按是否已处理：framework 长按回调与 repeat 兜底共用，避免重复 toggle */
+    private var okLongPressHandled = false
+
+    /** 系统长按阈值；部分盒子只发 repeat、不发 onKeyLongPress，用它做兜底判定 */
+    private fun longPressTimeoutMs(): Long = ViewConfiguration.getLongPressTimeout().toLong()
+
+    /** 长按 OK 的收藏对象：节目单里收藏高亮频道，否则收藏当前播放频道 */
+    private fun favoriteTargetForLongPress(): Channel? =
+        if (epgVisible) allChannels.getOrNull(epgIndex) else currentChannel
+
+    /** 统一的 5 秒倒计时：到点把右上信息卡、底部信息栏一起收起 */
+    private val hideInfoCardRunnable = Runnable { hideTransientInfo() }
+
+    // ---- 实时网速（1.9.5）：每 1 秒采样下行字节数，平滑后显示在信息卡底部 ----
+    private var netSpeedRunning = false
+    private var lastRxBytes = -1L
+    private var lastTotalRxBytes = -1L
+    private var lastRxSampleMs = 0L
+    private var smoothedBps = 0.0
+    /** 观测到的峰值下行速率（缓慢衰减）：避免降码率后测得速率变低、清晰度再也升不回去 */
+    private var peakBps = 0.0
+    private var uidRxZeroSamples = 0
+    private var useUidRx = true
+
+    private val netSpeedTick = object : Runnable {
+        override fun run() {
+            if (!netSpeedRunning) return
+            handler.postDelayed(this, NET_SPEED_INTERVAL)
+            // 频道墙模式信息卡本就隐藏，采样纯属空转；只在播放态取流量、做 ABR 决策
+            if (mode != MODE_PLAYER) return
+            updateNetSpeed()
+            // 每次采样后按实时网速校准清晰度上限（升档 / 降档都在这里决策）
+            applyAdaptiveQuality()
+        }
+    }
+
+    private val hideReservationRunnable = Runnable {
+        reservationCard.visibility = View.GONE
+        reservationTarget = null
+    }
+
+    /** 前台每分钟检查一次：按全局周期强制刷新 Token，并刷新 EPG 面板时间 */
+    private val tokenTick = object : Runnable {
+        override fun run() {
+            handler.postDelayed(this, TICK_INTERVAL)
+            val minutes = prefs.tokenRefreshMinutes
+            if (minutes <= 0 || !repository.hasSources) return
+            if (repository.sources.none { it.hasToken }) return
+            if (System.currentTimeMillis() - lastTokenRefresh < minutes * 60_000L) return
+            lastTokenRefresh = System.currentTimeMillis()
+            ioExecutor.execute {
+                val changed = tokens.forceRefresh(repository.sources, minutes)
+                if (changed) runOnUiThread {
+                    httpFactory.setDefaultRequestProperties(repository.allHeaders())
+                    reloadPlaylist()
+                }
+            }
+        }
+    }
+
+    private val epgTick = object : Runnable {
+        override fun run() {
+            handler.postDelayed(this, TICK_INTERVAL)
+            checkReservations()
+            if (epgVisible) {
+                epgTimeView.text = "当前时间  " +
+                    SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+                epgAdapter.refreshGuide()
+                updateEpgDetail()
+            }
+            val now = System.currentTimeMillis()
+            if (prefs.epgUrl.isNotBlank() && now - lastEpgAttempt >= EPG_CHECK_INTERVAL) {
+                lastEpgAttempt = now
+                loadEpgInBackground()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ 生命周期
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setContentView(R.layout.activity_main)
+
+        bindViews()
+        repository = PlaylistRepository(this)
+        tokens = repository.tokens
+        prefs = Prefs(this)
+        epg = EpgRepository(this)
+        lastSettingsVersion = prefs.version
+        settingsButton.setOnClickListener { openSettings() }
+
+        channelAdapter = ChannelAdapter(
+            onSelect = { channel -> playChannel(channel) },
+            prefs = prefs,
+            onFocus = ::onCardFocus,
+            onToggleFavorite = ::toggleFavorite,
+            onRecycled = ::onHostRecycled,
+            onSelectionChanged = ::updateSelectionBar
+        )
+        spanCount = calculateSpanCount()
+        applyResponsiveWallPadding()
+        gridView.layoutManager = GridLayoutManager(this, spanCount)
+        gridView.adapter = channelAdapter
+        gridView.itemAnimator = null
+        gridView.setHasFixedSize(true)
+        gridView.setItemViewCacheSize(4)
+        gridView.recycledViewPool.setMaxRecycledViews(0, 24)
+
+        // 纵向滑动频道时隐藏顶部栏（分类/设置/logo）放大视野，停手立即恢复
+        gridView.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                if (dy != 0 && mode == MODE_WALL) {
+                    setWallHeaderHidden(true)
+                    handler.removeCallbacks(showWallHeaderRunnable)
+                }
+            }
+
+            override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                if (newState == RecyclerView.SCROLL_STATE_IDLE) {
+                    handler.removeCallbacks(showWallHeaderRunnable)
+                    // 停手立即恢复顶部栏，不再延时等待
+                    setWallHeaderHidden(false)
+                }
+            }
+        })
+
+        // 网格铺满整个墙面，首排卡片需避开悬浮菜单：把网格顶部 padding 设为浮层高度。
+        // clipToPadding=false 让上滑的卡片能继续绘制到 padding 区、被浮层遮住（自动隐藏），
+        // 而不是在浮层下缘出现生硬留白。浮层高度随横竖屏变化，旋转后需重测。
+        applyOverlayTopPadding()
+
+        // 手机/平板：全部分类横向排列、横滑浏览，无「更多」弹窗、无按屏宽截断
+        groupAdapter = GroupAdapter(this, ::selectGroup)
+        groupListView.layoutManager = LinearLayoutManager(this, RecyclerView.HORIZONTAL, false)
+        groupListView.adapter = groupAdapter
+        groupListView.itemAnimator = null
+        groupListView.overScrollMode = View.OVER_SCROLL_NEVER
+        // 整列表滑动：墙面布局完成后只需更新卡片高度，不再按行数重新切片/翻页
+        gridView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            gridView.post {
+                if (!pageRowsResolved && gridView.height > 0) {
+                    pageRowsResolved = true
+                    pageRows = calculatePageRows()
+                }
+                updateCardHeight()
+            }
+        }
+
+        epgAdapter = EpgAdapter(
+            onPick = ::pickEpgChannel,
+            guide = { channel -> epg.guideLine(channel) },
+            isFavorite = { channel -> prefs.isFavorite(channel.stableKey()) }
+        )
+        epgListView.layoutManager = LinearLayoutManager(this)
+        epgListView.adapter = epgAdapter
+        epgListView.itemAnimator = null
+
+        setupPlayer()
+        updateNowPlayingChip()
+
+        handleIntent(intent)
+        loadInitial()
+        loadEpgInBackground()
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 从设置中心返回时清掉残留的长按状态，避免下一次短按被误判
+        handler.removeCallbacks(menuLongPressRunnable)
+        menuLongPressFired = false
+        applyPlayerSettings()
+        stopPreview()
+        updateMeta()
+        updateInfoProgram()
+        if (prefs.version != lastSettingsVersion) {
+            lastSettingsVersion = prefs.version
+            // 异步拉源完成后会重算页码，必须把「保留当前页」传进去，否则仍会跳回第 1 页
+            if (repository.hasSources) reloadPlaylist(preservePage = true)
+            loadEpgInBackground()
+            buildGroups()
+            // 从设置返回保留用户正在浏览的页码（所有分组，不只是虚拟分组）
+            applyFilter(focusFirst = false, keepPage = currentPage)
+        }
+        // 台标 / 封面风格是静默写入（不触发重新拉源），返回时按变化重绘墙面
+        channelAdapter.setCurrent(currentChannel?.url)
+        if (prefs.logoMode != lastLogoMode || prefs.coverMode != lastCoverMode) {
+            lastLogoMode = prefs.logoMode
+            lastCoverMode = prefs.coverMode
+            channelAdapter.notifyDataSetChanged()
+        }
+        handler.removeCallbacks(tokenTick)
+        handler.removeCallbacks(epgTick)
+        handler.post(tokenTick)
+        handler.postDelayed(epgTick, TICK_INTERVAL)
+        startNetSpeedUpdates()
+        if (!previewAllowed()) releasePreviewPlayer()
+        // onPause 撤掉了 5 秒收起倒计时；返回时若控制条仍可见要重新计时，否则常驻
+        if (::playerControls.isInitialized && playerControls.visibility == View.VISIBLE) {
+            scheduleInfoHide()
+        }
+    }
+
+    /**
+     * 手机 / 平板横竖屏切换：Manifest 已声明 configChanges，系统不重建 Activity，
+     * 因此需在这里重算列数并重建网格，否则旋转后仍是旧列数、卡片尺寸错乱。
+     */
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (!::gridView.isInitialized || !::channelAdapter.isInitialized) return
+        applyResponsiveWallPadding()
+        // 浮层高度由 wrap_content 自适应，旋转只需确保它恢复可见（网格位置始终不变）
+        if (::wallTopOverlay.isInitialized) {
+            setWallHeaderHidden(false)
+        }
+        // 浮层高度随横竖屏变化，重测后更新网格顶部 padding
+        applyOverlayTopPadding()
+        val newSpan = calculateSpanCount()
+        val layoutChanged = newSpan != spanCount
+        if (layoutChanged) {
+            spanCount = newSpan
+            gridView.layoutManager = GridLayoutManager(this, spanCount)
+        }
+        // 整列表滑动：旋转只重算尺寸，保留当前滚动位置，不重新切片/跳页
+        pageRowsResolved = false
+        gridView.post {
+            pageRows = calculatePageRows()
+            pageRowsResolved = true
+            updateCardHeight()
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // 墙面模式绝不自动恢复播放：同时解两路视频会拖垮手机解码器；
+        // playWhenReady 已在 preparePlayback 里设好，这里仅在播放态补一次即可（ExoPlayer.play 幂等）
+        if (!isFinishing && !isDestroyed && mode == MODE_PLAYER &&
+            currentChannel != null && !userPaused && !player.playWhenReady
+        ) {
+            player.play()
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        player.pause()
+        previewPlayer?.pause()
+    }
+
+    override fun onPause() {
+        stopNetSpeedUpdates()
+        handler.removeCallbacks(tokenTick)
+        handler.removeCallbacks(epgTick)
+        handler.removeCallbacks(menuLongPressRunnable)
+        handler.removeCallbacks(hideInfoCardRunnable)
+        // 离屏时撤销所有与「当前这次播放」绑定的排队任务，避免后台重新起播或切错线路
+        cancelStallCheck()
+        cancelAutoLineSwitch()
+        switchLinePending = false
+        audioSwitchPending = false
+        // 这里不要重置 menuLongPressFired：长按打开设置页后，抬键事件可能落到本页，
+        // 提前清掉会被误判成短按而重新呼出信息栏；改由 onKeyUp / onResume 复位。
+        // 切后台时清掉未确认的台号，避免 2.5 秒后在后台偷偷换台
+        cancelNumberInput()
+        stopPreview()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        stopPreview()
+        releasePreviewPlayer()
+        ioExecutor.shutdownNow()
+        if (::player.isInitialized) player.release()
+        super.onDestroy()
+    }
+
+    private fun bindViews() {
+        wallLayer = findViewById(R.id.wallLayer)
+        wallTopOverlay = findViewById(R.id.wallTopOverlay)
+        wallHeader = findViewById(R.id.wallHeader)
+        gridView = findViewById(R.id.channelGrid)
+        groupListView = findViewById(R.id.groupList)
+        countView = findViewById(R.id.countView)
+        nowPlayingChip = findViewById(R.id.nowPlayingChip)
+        sourceLabelView = findViewById(R.id.sourceLabel)
+        emptyHint = findViewById(R.id.emptyHint)
+
+        pagerBar = findViewById(R.id.pagerBar)
+        selectionBar = findViewById(R.id.selectionBar)
+        btnPrevPage = findViewById(R.id.btnPrevPage)
+        btnNextPage = findViewById(R.id.btnNextPage)
+        btnManageRecent = findViewById(R.id.btnManageRecent)
+        pageInfoView = findViewById(R.id.pageInfo)
+        pageRangeView = findViewById(R.id.pageRange)
+        selCountView = findViewById(R.id.selCount)
+        btnSelAll = findViewById(R.id.btnSelAll)
+        btnSelInvert = findViewById(R.id.btnSelInvert)
+        btnSelDelete = findViewById(R.id.btnSelDelete)
+        btnSelCancel = findViewById(R.id.btnSelCancel)
+        btnSelPrev = findViewById(R.id.btnSelPrev)
+        btnSelNext = findViewById(R.id.btnSelNext)
+        setupWallBarActions()
+
+        playerView = findViewById(R.id.playerView)
+        // 手机/平板标准控制条
+        playerControls = findViewById(R.id.playerControls)
+        ctrlName = findViewById(R.id.ctrlName)
+        ctrlMeta = findViewById(R.id.ctrlMeta)
+        ctrlProgram = findViewById(R.id.ctrlProgram)
+        ctrlTime = findViewById(R.id.ctrlTime)
+        ctrlDuration = findViewById(R.id.ctrlDuration)
+        ctrlProgress = findViewById(R.id.ctrlProgress)
+        ctrlPlayPause = findViewById(R.id.ctrlPlayPause)
+        setupPlayerControls()
+
+        statusView = findViewById(R.id.playbackStatus)
+        hintView = findViewById(R.id.hintBar)
+        loadingView = findViewById(R.id.loadingView)
+        errorView = findViewById(R.id.errorView)
+        settingsButton = findViewById(R.id.settingsButton)
+
+        channelInfoCard = findViewById(R.id.channelInfoCard)
+        infoNumberView = findViewById(R.id.infoNumber)
+        infoNameView = findViewById(R.id.infoName)
+        infoMetaView = findViewById(R.id.infoMeta)
+        infoGroupView = findViewById(R.id.infoGroup)
+        infoProgramView = findViewById(R.id.infoProgram)
+        infoNextView = findViewById(R.id.infoNext)
+        infoExtraView = findViewById(R.id.infoExtra)
+        infoTimeView = findViewById(R.id.infoTime)
+        infoNetSpeedView = findViewById(R.id.infoNetSpeed)
+        reservationCard = findViewById(R.id.reservationCard)
+
+        bottomInfoBar = findViewById(R.id.bottomInfoBar)
+        bottomLogo = findViewById(R.id.bottomLogo)
+        bottomLogoLetter = findViewById(R.id.bottomLogoLetter)
+        bottomName = findViewById(R.id.bottomName)
+        bottomMeta = findViewById(R.id.bottomMeta)
+        bottomTime = findViewById(R.id.bottomTime)
+        bottomRange = findViewById(R.id.bottomRange)
+        bottomProgram = findViewById(R.id.bottomProgram)
+        bottomProgress = findViewById(R.id.bottomProgress)
+        bottomProgressText = findViewById(R.id.bottomProgressText)
+        bottomNext = findViewById(R.id.bottomNext)
+        btnFav = findViewById(R.id.btnFav)
+        btnGuide = findViewById(R.id.btnGuide)
+        btnLine = findViewById(R.id.btnLine)
+        btnQuality = findViewById(R.id.btnQuality)
+        btnControl = findViewById(R.id.btnControl)
+        btnEngine = findViewById(R.id.btnEngine)
+        btnSettings = findViewById(R.id.btnSettings)
+        btnClear = findViewById(R.id.btnClear)
+        setupBottomActions()
+
+        numberInputCard = findViewById(R.id.numberInputCard)
+        numberInputDigitsView = findViewById(R.id.numberInputDigits)
+        numberInputMatchView = findViewById(R.id.numberInputMatch)
+        // 数字选台浮层的可见取消按钮
+        findViewById<View>(R.id.btnNumberCancel).setOnClickListener { cancelNumberInput() }
+
+        epgPanel = findViewById(R.id.epgPanel)
+        epgListView = findViewById(R.id.epgList)
+        epgTimeView = findViewById(R.id.epgTime)
+        epgTitleView = findViewById(R.id.epgTitle)
+        epgDetailView = findViewById(R.id.epgDetail)
+        // 节目单浮层的可见收起按钮（触屏用户不依赖 BACK 键）
+        findViewById<View>(R.id.btnEpgBack).setOnClickListener { hideEpg() }
+        // 启动即处于频道墙：先不创建全屏视频 surface，缩短首帧时间
+        playerView.visibility = View.GONE
+    }
+
+    private fun loadInitial() {
+        if (repository.hasSources) {
+            reloadPlaylist(autoPlayLast = true)
+        } else {
+            bindChannels(emptyList())
+            sourceLabelView.text = "未添加订阅"
+            emptyHint.visibility = View.VISIBLE
+            emptyHint.text = "还没有播放源　·　点右上角「设置」→ 粘贴一个聚合订阅链接即可"
+            handler.postDelayed({
+                if (!repository.hasSources && !isFinishing) openSettings()
+            }, 1200)
+        }
+    }
+
+    /**
+     * 冷启动自动播放上次退出时的频道（1.10）。
+     * 优先按 stableKey 精确匹配（换源 / 频道顺序变化也不丢），找不到再回退到保存的 index。
+     * 只做一次且必须是全屏播放模式，避免外部导入链接 / 设置返回等 reload 场景突然起播。
+     */
+    private fun autoPlayLastChannel() {
+        if (autoPlayedOnLaunch) return
+        autoPlayedOnLaunch = true
+        if (allChannels.isEmpty() || isFinishing || isDestroyed) return
+        val key = prefs.lastPlayedKey
+        val target = (if (key.isNotBlank()) allChannels.firstOrNull { it.stableKey() == key } else null)
+            ?: allChannels.getOrNull(repository.lastIndex)
+        if (target == null) return
+        // 上次频道若已失效隐藏则跳过，避免一进软件就播一个被隐藏的频道
+        if (prefs.hideFailedChannels && target.stableKey() in hiddenSnapshot) return
+        runCatching { playChannel(target, enterPlayer = true) }
+            .onFailure { Diagnostics.log(this, "PLAYER", "恢复上次频道失败：${it.message}") }
+    }
+
+    /**
+     * 手机竖屏把频道墙左右 / 顶部留白收紧，给顶部工具条腾出横向空间，
+     * 避免「设置」「正在播放」被挤出屏幕点不到；横屏 / 平板保留宽留白观感。
+     */
+    private fun applyResponsiveWallPadding() {
+        if (!::wallLayer.isInitialized) return
+        val metrics = resources.displayMetrics
+        val widthDp = metrics.widthPixels / metrics.density
+        val heightDp = metrics.heightPixels / metrics.density
+        val compact = heightDp > widthDp && widthDp < 600f
+        val horizontal = (if (compact) 12f else 44f) * metrics.density
+        // 网格已 match_parent 铺满、顶部留白交给浮层高度（网格 paddingTop），
+        // 故 wallLayer 自身 top padding 设为 0，避免双重留白；左右/底部留白保留。
+        val top = 0
+        val bottom = 8f * metrics.density
+        wallLayer.setPadding(horizontal.toInt(), top, horizontal.toInt(), bottom.toInt())
+    }
+
+    /**
+     * 手机版响应式列数：手机竖屏用 2 列（卡片够大好点），横屏 / 平板按宽度自适应。
+     * TV 版固定 3 列下限，这里对窄屏放宽到 2 列，宽屏仍按 ~190dp 一张卡计算。
+     */
+    private fun calculateSpanCount(): Int {
+        val metrics = resources.displayMetrics
+        val widthDp = metrics.widthPixels / metrics.density
+        val heightDp = metrics.heightPixels / metrics.density
+        val portrait = heightDp > widthDp
+        // 手机竖屏（宽度 < 600dp）用 2 列；平板竖屏 / 所有横屏按宽度算
+        return if (portrait && widthDp < 600f) {
+            2
+        } else {
+            (widthDp / 190f).toInt().coerceIn(3, 8)
+        }
+    }
+
+    /**
+     * 每页行数自适应（手机版）：以「卡片不要过高、也不要太密」为目标反推行数。
+     * 竖屏：高度充裕、列数少 → 行数多（约 4~6 行），卡片接近方形更好点；
+     * 横屏 / 平板：高度有限、列数多 → 行数少（约 2~3 行），接近 TV 观感。
+     * 用「卡片高度上限 ~200dp、下限 ~110dp」把行数钳在合理区间。
+     */
+    private fun calculatePageRows(): Int {
+        val density = resources.displayMetrics.density
+        if (density <= 0f || spanCount <= 0) return 3
+        val gridH = gridView.height.takeIf { it > 0 }
+            ?: (resources.displayMetrics.heightPixels * 0.62f).toInt()
+        if (gridH <= 0) return 3
+        val usableH = (gridH / density).coerceAtLeast(200f) // dp
+        // 目标卡片高度（dp）：竖屏偏低让行数变多，横屏偏高让行数变少
+        val metrics = resources.displayMetrics
+        val portrait = metrics.heightPixels > metrics.widthPixels
+        val targetCardDp = if (portrait) 132f else 196f
+        val rows = (usableH / targetCardDp).toInt()
+        return rows.coerceIn(MIN_PAGE_ROWS, MAX_PAGE_ROWS)
+    }
+
+    // ------------------------------------------------------------ 频道墙分页 / 首行工具条
+
+    private fun setupWallBarActions() {
+        btnPrevPage.setOnClickListener { goPage(currentPage - 1) }
+        btnNextPage.setOnClickListener { goPage(currentPage + 1) }
+        btnManageRecent.setOnClickListener { enterRecentSelection() }
+        btnSelAll.setOnClickListener { channelAdapter.selectAll(allRecentKeys()) }
+        btnSelInvert.setOnClickListener { channelAdapter.invertSelection(allRecentKeys()) }
+        btnSelDelete.setOnClickListener { deleteSelectedRecent() }
+        btnSelCancel.setOnClickListener { exitRecentSelection() }
+        btnSelPrev.setOnClickListener { goPage(currentPage - 1) }
+        btnSelNext.setOnClickListener { goPage(currentPage + 1) }
+    }
+
+    /**
+     * 网格铺满墙面时，首排卡片会被顶部悬浮菜单盖住。把网格顶部 padding 设为浮层实测高度，
+     * 让首排从菜单下方开始；clipToPadding=false 保证上滑卡片仍能绘制进 padding 区被菜单遮住。
+     * 在浮层完成首次布局后测量；旋转后重新调用。
+     */
+    private fun applyOverlayTopPadding() {
+        if (!::wallTopOverlay.isInitialized || !::gridView.isInitialized) return
+        wallTopOverlay.post {
+            val overlayH = wallTopOverlay.height
+            if (overlayH > 0) {
+                gridView.setPadding(
+                    gridView.paddingLeft,
+                    overlayH,
+                    gridView.paddingRight,
+                    gridView.paddingBottom
+                )
+                // paddingTop 变化会影响可用高度，重算卡片高度（宽度不变，比例 Still 16:9）
+                updateCardHeight()
+            }
+        }
+    }
+
+    /**
+     * 滑动频道时淡出顶部悬浮层（logo/设置/分类）放大视野，停手立即还原。
+     * 关键：顶部栏是覆盖在频道网格之上的独立层，网格 match_parent 铺满、位置尺寸恒定；
+     * 显隐只改浮层透明度 + 轻微位移，绝不改变网格高度/位置——因此下的台不会随菜单下移，
+     * 被菜单遮住的卡片自然隐藏，菜单收起后原样露出。
+     */
+    private fun setWallHeaderHidden(hidden: Boolean) {
+        if (!::wallTopOverlay.isInitialized || wallHeaderHidden == hidden) return
+        wallHeaderHidden = hidden
+        val alpha = if (hidden) 0f else 1f
+        val shift = if (hidden) -12f else 0f
+        wallTopOverlay.animate().alpha(alpha).translationY(shift).setDuration(160).start()
+        // 隐藏时关闭浮层自身对触摸的拦截，避免透明状态下挡住顶部卡片的点击
+        wallTopOverlay.isClickable = !hidden
+    }
+
+    /**
+     * 卡片高度 = 墙面可用高度 / 当前行数 - 上下 margin；列宽一并传给 Adapter，
+     * 让台标展示框按「当前卡片窗口」等比归一，不因图标原始尺寸不一而忽大忽小或溢出。
+     * 行数（pageRows）在手机版按屏幕自适应，TV 版固定 3；都能完整铺满且不滚动。
+     */
+    private fun updateCardHeight() {
+        if (gridView.height <= 0 || gridView.width <= 0) return
+        val density = resources.displayMetrics.density
+        val columnWidth =
+            (gridView.width - gridView.paddingLeft - gridView.paddingRight) / spanCount
+        // 手机版整列表滑动：卡片按常规视频 16:9 横向比例取高度（去掉左右 margin 后的实际宽度 × 9/16），
+        // 不再做成近正方形；上下限保证小卡片仍可点、大屏平板卡片不过分夸张。
+        val marginPx = 6f * density
+        val cardWidth = columnWidth - marginPx * 2f
+        val perRow = (cardWidth * 9f / 16f).toInt()
+            .coerceIn((84f * density).toInt(), (200f * density).toInt())
+        channelAdapter.setCardHeight(perRow, columnWidth)
+    }
+
+    private fun pageSize(): Int = (spanCount * pageRows).coerceAtLeast(pageRows)
+
+    private fun pageCount(): Int =
+        ((filteredChannels.size + pageSize() - 1) / pageSize()).coerceAtLeast(1)
+
+    /**
+     * 手机版不分页：把全部筛选结果一次性提交给 Adapter，由 RecyclerView 直接上下滑动。
+     * currentPage/pageSize 仍作为「定位换算」使用——把要跳转的频道换算成列表位置，
+     * 这样启动续播、换分组、换台后定位等既有逻辑无需重写。
+     */
+    private fun applyPage(focusFirst: Boolean) {
+        val size = pageSize()
+        currentPage = currentPage.coerceIn(0, pageCount() - 1)
+        channelAdapter.submit(filteredChannels, forceRefresh = true)
+        // 定位到当前页对应的列表位置（页首），而非列表顶部
+        val targetPos = (currentPage * size).coerceIn(0, (filteredChannels.size - 1).coerceAtLeast(0))
+        gridView.scrollToPosition(targetPos)
+        updatePagerBar()
+        updateSelectionBar()
+        if (filteredChannels.isEmpty()) {
+            emptyHint.visibility = View.VISIBLE
+            emptyHint.text = when {
+                allChannels.isEmpty() ->
+                    "还没有频道　·　点右上角「设置」添加播放源"
+                activeGroup == Library.GROUP_FAVORITE ->
+                    "还没有收藏的频道　·　播放时点底部「☆ 收藏」，或在节目单里收藏"
+                activeGroup == Library.GROUP_RECENT ->
+                    "最近观看里暂时没有可播放频道　·　点上方「全部」查看全部频道"
+                else -> "这个分组暂时没有频道　·　点上方「全部」查看全部频道"
+            }
+        } else {
+            emptyHint.visibility = View.GONE
+        }
+        if (focusFirst) focusCard(0)
+    }
+
+    private fun updatePagerBar() {
+        if (!::pagerBar.isInitialized) return
+        countView.text = "${filteredChannels.size} 个频道"
+        // 手机版取消翻页后，原「分组 · 共 N 个频道 · 上下滑动浏览」整行提示已删除：
+        // pagerBar 平时整行隐藏，仅在「最近观看」分组显示，用来承载「管理记录」多选入口。
+        val showManage = activeGroup == Library.GROUP_RECENT && filteredChannels.isNotEmpty() &&
+            !channelAdapter.isSelectionMode()
+        pageInfoView.visibility = View.GONE
+        pageRangeView.visibility = View.GONE
+        btnManageRecent.visibility = if (showManage) View.VISIBLE else View.GONE
+        pagerBar.visibility = if (showManage) View.VISIBLE else View.GONE
+    }
+
+    /** 手机版不分页：整列表滑动，翻页入口已移除，这些方法保留为空操作避免调用点报错 */
+    private fun goPage(page: Int, focusLast: Boolean = false) { /* no-op：整列表滑动 */ }
+
+    /** 手机版不分页：边界不翻页，交回 RecyclerView 自身焦点移动 */
+    private fun tryEdgePage(delta: Int): Boolean = false
+
+    // ---- 最近观看：单选 / 多选 / 全选删除 ----
+
+    private fun enterRecentSelection() {
+        if (activeGroup != Library.GROUP_RECENT || filteredChannels.isEmpty()) {
+            toast("当前没有可管理的最近观看记录")
+            return
+        }
+        pagerBar.visibility = View.GONE
+        selectionBar.visibility = View.VISIBLE
+        channelAdapter.setSelectionMode(true)
+        updateSelectionBar()
+        focusCard(0)
+        toast("OK 选择 / 取消　·　全选 / 反选 / 删除所选　·　BACK 退出")
+    }
+
+    private fun exitRecentSelection() {
+        channelAdapter.setSelectionMode(false)
+        pagerBar.visibility = View.VISIBLE
+        selectionBar.visibility = View.GONE
+        updatePagerBar()
+        focusCard(0)
+    }
+
+    /** 退出多选但不触发翻页重排，供筛选 / 换分组时内部调用 */
+    private fun cancelSelectionQuiet() {
+        if (channelAdapter.isSelectionMode()) channelAdapter.setSelectionMode(false)
+        if (::pagerBar.isInitialized) {
+            pagerBar.visibility = View.VISIBLE
+            selectionBar.visibility = View.GONE
+        }
+    }
+
+    /** 全选 / 反选作用于整个「最近观看」结果，而不是当前这一页 */
+    private fun allRecentKeys(): List<String> = filteredChannels.map { it.stableKey() }
+
+    private fun updateSelectionBar() {
+        if (!::selCountView.isInitialized) return
+        val count = channelAdapter.selectedCount()
+        selCountView.text = "已选 $count 项"
+        btnSelDelete.text = if (count > 0) "删除所选 ($count)" else "删除所选"
+        btnSelDelete.alpha = if (count > 0) 1f else 0.5f
+        val pages = pageCount()
+        btnSelPrev.isEnabled = currentPage > 0
+        btnSelNext.isEnabled = currentPage < pages - 1
+        btnSelPrev.alpha = if (btnSelPrev.isEnabled) 1f else 0.45f
+        btnSelNext.alpha = if (btnSelNext.isEnabled) 1f else 0.45f
+    }
+
+    private fun deleteSelectedRecent() {
+        val keys = channelAdapter.selectedKeySet()
+        if (keys.isEmpty()) {
+            toast("先按 OK 选择要删除的记录")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("删除最近观看记录")
+            .setMessage("将从「最近观看」移除 ${keys.size} 条记录，频道与收藏不受影响。")
+            .setPositiveButton("删除") { _, _ ->
+                prefs.removeRecent(keys)
+                toast("已删除 ${keys.size} 条记录")
+                cancelSelectionQuiet()
+                applyFilter(focusFirst = true, targetChannel = null, resetPage = true)
+            }
+            .setNegativeButton("取消", null)
+            .showFitting()
+    }
+
+    // ------------------------------------------------------------ 播放器
+
+    private val playerListener = object : Player.Listener {
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            when (playbackState) {
+                Player.STATE_BUFFERING -> {
+                    if (mode == MODE_PLAYER) loadingView.visibility = View.VISIBLE
+                    // 1.9.5：连续缓冲 2 秒仍未恢复 → 先降清晰度重试，最低档仍卡才切源 / 重连
+                    scheduleStallCheck()
+                }
+                Player.STATE_READY -> {
+                    cancelStallCheck()
+                    loadingView.visibility = View.GONE
+                    errorView.visibility = View.GONE
+                    setPlaybackStatus(null)
+                    // 这条线路能播，记下来，下次起播直接用它
+                    lineSwitches = 0
+                    playbackFailures = 0
+                    externalFallbackTried = false
+                    // 已经恢复播放：撤销仍在排队的自动切线路，别把刚恢复的好线路又切走
+                    cancelAutoLineSwitch()
+                    switchLinePending = false
+                    audioSwitchPending = false
+                    currentChannel?.let { prefs.setLineIndex(it.stableKey(), currentLineIndex) }
+                }
+                Player.STATE_ENDED -> {
+                    cancelStallCheck()
+                    loadingView.visibility = View.GONE
+                    if (allChannels.size > 1) playNeighbor(1)
+                }
+                Player.STATE_IDLE -> cancelStallCheck()
+                else -> Unit
+            }
+        }
+
+        override fun onVideoSizeChanged(videoSize: VideoSize) {
+            if (videoSize.width > 0 && videoSize.height > 0) {
+                currentResolution = "${videoSize.width}×${videoSize.height}"
+                updateMeta()
+            }
+        }
+
+        /**
+         * 部分源「只有画面没声音」的根因：这些源用的是杜比 AC3/EAC3、AC4、DTS 音轨，
+         * 国产盒子普遍没有对应解码授权，ExoPlayer 拿到的音轨 isSupported=false，
+         * 于是画面照播、声音全无（也不会报播放错误）。
+         * 这里检测到就自动切到该频道的下一条线路（多数聚合源备用线路是 AAC），
+         * 都试过还不支持就明确提示，避免用户以为是 App 坏了。
+         */
+        override fun onTracksChanged(tracks: Tracks) {
+            val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+            if (audioGroups.isEmpty()) return
+            val selected = audioGroups.firstOrNull { it.isSelected } ?: return
+            if (selected.isSupported || selected.length == 0) {
+                audioUnsupportedNotified = false
+                return
+            }
+            val format = selected.getTrackFormat(0)
+            val mime = format.sampleMimeType.orEmpty()
+            val channel = currentChannel
+            val lines = channel?.allUrls()?.size ?: 0
+            Diagnostics.log(
+                this@MainActivity, "AUDIO",
+                "音轨不受支持 mime=$mime codecs=${format.codecs.orEmpty()} " +
+                    "ch=${format.channelCount} | ${channel?.name} | 线路=${currentLineIndex + 1}/$lines"
+            )
+            if (channel != null && prefs.autoSwitchLine && lines > 1 &&
+                audioSwitches < lines - 1 && !audioSwitchPending && !isFinishing
+            ) {
+                audioSwitches++
+                audioSwitchPending = true
+                nowPlayingChip.text = "● ${channel.name} · 音轨设备不支持，切换线路找有声源…"
+                nowPlayingChip.visibility = View.VISIBLE
+                // 播放态墙面是隐藏的，提示必须落到合并后的信息卡状态行才看得见
+                if (mode == MODE_PLAYER) {
+                    showPlayerOverlay()
+                    setPlaybackStatus("音轨不支持 · 正在切换线路…")
+                }
+                postAutoLineSwitch(900L)
+                return
+            }
+            if (!audioUnsupportedNotified) {
+                audioUnsupportedNotified = true
+                toast("该源音轨为${audioLabel(mime)}，本机无法解码 → 只有画面没有声音")
+            }
+        }
+
+        private fun audioLabel(mime: String): String = when {
+            mime.contains("eac3", true) || mime.contains("ec-3", true) -> "杜比 E-AC3"
+            mime.contains("ac3", true) || mime.contains("ac-3", true) -> "杜比 AC3"
+            mime.contains("ac4", true) -> "杜比 AC4"
+            mime.contains("truehd", true) -> "杜比 TrueHD"
+            mime.contains("dts", true) -> "DTS"
+            mime.isBlank() -> "未知格式"
+            else -> mime
+        }
+
+        override fun onPlayerError(error: PlaybackException) {
+            val channel = currentChannel
+            val lines = channel?.allUrls()?.size ?: 0
+
+            // 直播流的播放窗口会随真实时间向前推进；一旦播放位置落到窗口之外，
+            // ExoPlayer 会抛 BehindLiveWindowException。这是直播常态，回到直播边缘即可续播，
+            // 绝不能当「播放失败」处理，否则直播频道会频繁黑屏 / 报错误提示。
+            if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) {
+                Diagnostics.log(this@MainActivity, "LIVE", "直播窗口后移，自动回到直播边缘继续")
+                loadingView.visibility = View.VISIBLE
+                errorView.visibility = View.GONE
+                player.seekToDefaultPosition()
+                player.playWhenReady = true
+                return
+            }
+
+            // 多线路自动切换：一次失败就试下一条，直到所有线路都试过
+            if (channel != null && prefs.autoSwitchLine && lines > 1 &&
+                lineSwitches < lines - 1 && !isFinishing && !switchLinePending
+            ) {
+                switchLinePending = true
+                lineSwitches++
+                nowPlayingChip.text = "● ${channel.name} · 线路失败，切换备用源…"
+                nowPlayingChip.visibility = View.VISIBLE
+                if (mode == MODE_PLAYER) {
+                    showPlayerOverlay()
+                    setPlaybackStatus("线路失败 · 正在切换备用源…")
+                }
+                errorView.visibility = View.GONE
+                if (mode == MODE_PLAYER) loadingView.visibility = View.VISIBLE
+                postAutoLineSwitch(400L)
+                return
+            }
+
+            loadingView.visibility = View.GONE
+            val name = channel?.name.orEmpty()
+            val failedUrl = channel?.allUrls()?.getOrNull(currentLineIndex).orEmpty()
+            Diagnostics.log(
+                this@MainActivity, "ERROR",
+                "${error.errorCodeName} | $name | $failedUrl | ${error.message.orEmpty()}"
+            )
+
+            // 老盒子硬解码连续失败：自动换盒子上已装的外部播放器再解一次
+            playbackFailures++
+            if (
+                prefs.externalFallback &&
+                DeviceProfile.info(this@MainActivity).tier != DeviceProfile.Tier.MODERN &&
+                playbackFailures >= 2 && !externalFallbackTried &&
+                channel != null && channel.url.isNotBlank()
+            ) {
+                externalFallbackTried = true
+                Diagnostics.log(this@MainActivity, "DECODER", "内置解码连续失败，自动尝试外部播放器")
+                if (launchExternalPlayer(channel)) return
+            }
+
+            nowPlayingChip.text = "● 播放失败 · $name"
+            nowPlayingChip.visibility = View.VISIBLE
+
+            // 真正播放失败（所有线路都试过）：累计次数，达到阈值且开启过滤则自动隐藏该频道
+            channel?.let { registerPlaybackFailure(it) }
+
+            if (mode == MODE_PLAYER) {
+                errorView.visibility = View.VISIBLE
+                setPlaybackStatus("播放失败 · $name")
+                errorView.text = buildString {
+                    append("播放失败  ")
+                    append(error.errorCodeName)
+                    append("\n\n")
+                    append(name)
+                    append("\n")
+                    append(channel?.allUrls()?.getOrNull(currentLineIndex).orEmpty())
+                    if (lines > 1) append("\n\n按 ← → 快速切线路，短按 MENU →「线路」按来源挑选（共 $lines 条）")
+                    else append("\n\n确认源是否可用，或在设置里检查接口地址")
+                    append("\n\n订阅里若含组播 TS / 需登录的线路，内置播放器无法解析，请换线路或开启外部播放器回退")
+                    if (timeshiftStart != null) append("\n回看失败多为源不支持时移，按快退键回到直播")
+                    append("\n\n若全部频道都失败：设置 → 播放诊断 → 生成日志文件，可查 TLS / 解码 / 网络原因")
+                    append("\n\n按 BACK 返回频道墙换台，短按 MENU 呼出底部信息栏，长按 3 秒进设置")
+                }
+                showPlayerOverlay()
+            }
+        }
+    }
+
+    /**
+     * 频道累计播放失败次数；开启「自动隐藏播放失败的频道」且失败 ≥ 3 次时，
+     * 把该频道从墙面与筛选里移除（持久化），避免一打开就是满屏不能放的测试源 / 死链。
+     */
+    private fun registerPlaybackFailure(channel: Channel) {
+        if (!prefs.hideFailedChannels) return
+        val key = channel.stableKey()
+        val count = (channelFailures[key] ?: 0) + 1
+        channelFailures[key] = count
+        if (count >= 3 && prefs.addHiddenChannel(key)) {
+            hiddenSnapshot = prefs.hiddenChannels
+            toast("已自动隐藏播放失败的频道：${channel.name}")
+            buildGroups()
+            // 隐藏频道会改变筛选结果：重新分页并保留当前浏览的页
+            applyFilter(focusFirst = false, keepPage = currentPage)
+        }
+    }
+
+    private fun setupPlayer() {
+        if (!::httpFactory.isInitialized) {
+            // IPv6 优先：OkHttp 数据源 + 自定义 Dns（AAAA 排在 A 前，连不通自动回退 IPv4）。
+            // 保留原有超时 / User-Agent / 跨协议重定向语义；TLS1.2 老盒子兼容由 TlsCompat
+            // 在 Application 启动时装的 ProviderInstaller / 系统栈负责。
+            val okClient = OkHttpClient.Builder()
+                .dns(Ipv6PreferredDns(this))
+                .connectTimeout(5000, TimeUnit.MILLISECONDS)
+                // 移动网络 HLS 分片偶发偏慢，6s 偏紧易误判坏源触发切源；放宽到 10s
+                .readTimeout(10000, TimeUnit.MILLISECONDS)
+                .retryOnConnectionFailure(true)
+                .followRedirects(true)
+                .followSslRedirects(true) // 等价原 setAllowCrossProtocolRedirects(true)
+                .build()
+            httpFactory = OkHttpDataSource.Factory(okClient)
+                .setUserAgent(USER_AGENT)
+            Diagnostics.log(this, "NET", "播放 DNS 策略：IPv6 优先，失败自动回退 IPv4")
+        }
+        // 请求头（含实时 Token）每次都重新注入，预览播放器共用同一个 factory
+        httpFactory.setDefaultRequestProperties(repository.allHeaders())
+        dataSourceFactory = DefaultDataSource.Factory(this, httpFactory)
+
+        fastBufferMode = prefs.isFastEngine
+        trackSelector = DefaultTrackSelector(this)
+        // 老盒子硬解常缺 H.265 / 部分 High profile：允许软解兜底，「能播」优先于「极致流畅」。
+        // 1.2 关掉软解回退后，部分盒子一个频道都起不来，这里恢复。
+        val renderers = DefaultRenderersFactory(this)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
+            .setEnableDecoderFallback(true)
+        Diagnostics.log(
+            this, "PLAYER",
+            Diagnostics.device().replace("\n", " | ") +
+                " | 解码回退=开 | 画质=${prefs.quality} | 引擎=${prefs.engine}"
+        )
+        player = ExoPlayer.Builder(this, renderers)
+            .setTrackSelector(trackSelector)
+            .setLoadControl(buildLoadControl(fastBufferMode))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+
+        playerView.player = player
+        // 主播放器显式持有音频焦点（预览小窗不抢），保证切台/回前台后声音一定恢复
+        player.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build(),
+            /* handleAudioFocus= */ true
+        )
+        player.addListener(playerListener)
+        applyTrackParameters()
+
+        // 触摸手势：挂在播放画面上，回调全部复用既有遥控器逻辑，行为一致。
+        // 单击显隐浮层 / 双击播放暂停 / 左右滑换台 / 上下滑音量亮度。
+        touchGestures = TouchGestures(
+            activity = this,
+            onSingleTap = {
+                if (!::playerControls.isInitialized) return@TouchGestures
+                if (playerControls.visibility == View.VISIBLE) {
+                    hideTransientInfo()
+                } else {
+                    val ch = currentChannel
+                    if (ch != null) showChannelInfo(ch) else showPlayerOverlay()
+                }
+            },
+            onDoubleTap = { togglePlayback() },
+            onNextChannel = { playNeighbor(1) },
+            onPrevChannel = { playNeighbor(-1) }
+        )
+        touchGestures.attach(playerView)
+    }
+
+    /**
+     * 缓冲按盒子能力收敛：1.9.5 再下调起播阈值与重缓冲阈值，首帧更快出现；
+     * 卡顿有 2 秒自动切源 / 重连兜底，不必靠预取大量内容硬扛。
+     * 老盒子封顶更小的最大缓冲，避免内存抖动。
+     */
+    private fun buildLoadControl(fast: Boolean): DefaultLoadControl {
+        val legacy = DeviceProfile.info(this).tier != DeviceProfile.Tier.MODERN
+        return DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                if (fast) 4500 else 10000,
+                if (fast) (if (legacy) 15000 else 20000) else (if (legacy) 22000 else 28000),
+                if (fast) 300 else 600,
+                if (fast) 600 else 1200
+            )
+            // Media3 1.4.1 的 Builder 不再暴露 backBuffer 接口，缓冲量统一由上面四个参数控制
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+    }
+
+    /**
+     * 判断一个地址是不是 HLS 直播流。
+     *
+     * 不只看 .m3u8 后缀——大量聚合源的 HLS 入口没有扩展名（如 /play/123、/live?token=、
+     * /index.m3u?...），还有 .m3u 形式。凡是「没有明确渐进式媒体容器扩展名」的，都按 HLS 处理。
+     * 否则老盒子（useChunkless=false）会把 m3u8 当渐进流走 setMediaItem，导致全部频道起播失败。
+     */
+    private fun isHlsUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        if (lower.contains(".m3u8") || lower.contains(".m3u?") || lower.contains("format=m3u8") ||
+            lower.contains("format=hls")
+        ) {
+            return true
+        }
+        // 命中这些明确的渐进式容器扩展名才当普通文件，否则默认按 HLS 处理。
+        // 列表是 companion 常量：换台热路径不再每次新建 ArrayList。
+        return !PROGRESSIVE_EXTENSIONS.any { lower.contains(it) }
+    }
+
+    /**
+     * HLS 一律走专用 factory 起播，与设备新旧无关——old 盒子只是关掉 chunkless preparation，
+     * 不会再退化成「把 m3u8 当渐进流」导致全部黑屏。其它协议交回默认 factory 嗅探。
+     */
+    private fun preparePlayback(mediaItem: MediaItem, url: String) {
+        cancelStallCheck()
+        cancelAutoLineSwitch()
+        playbackGeneration++
+        // 每次起播都是新会话：清掉上一频道的码率封顶与卡顿抑制状态，
+        // 否则「A 卡顿降到 800k → 换到 B」会让 B 长时间低清晰度播放。
+        // setMaxVideoBitrate 是 TrackSelector 的粘性参数，必须显式重设为不限制。
+        adaptiveBitrateCap = -1
+        adaptiveUpgradeSamples = 0
+        adaptiveUpgradeHoldUntil = 0L
+        lastStallDowngradeMs = 0L
+        lastStallSwitchMs = 0L
+        lastStallReconnectMs = 0L
+        applyTrackParameters()
+        val chunkless = DeviceProfile.useChunkless(this)
+        if (isHlsUrl(url)) {
+            val source = HlsMediaSource.Factory(dataSourceFactory)
+                .setAllowChunklessPreparation(chunkless)
+                .setTimestampAdjusterInitializationTimeoutMs(1200)
+                .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(2))
+                .createMediaSource(mediaItem)
+            player.setMediaSource(source)
+            Diagnostics.log(this, "PLAY", "起播(HLS) ${url.take(140)} · chunkless=$chunkless")
+        } else {
+            player.setMediaItem(mediaItem)
+            Diagnostics.log(this, "PLAY", "起播(渐进) ${url.take(140)} · chunkless=$chunkless")
+        }
+        // 先给 playWhenReady 再 prepare：少一次播放状态切换，首帧更快出现。
+        // 墙面模式（后台续播关闭时）不自动出声出画，避免又占一路解码器
+        player.playWhenReady = mode == MODE_PLAYER && !userPaused
+        player.prepare()
+    }
+
+    /** 画质设置：限制视频轨道上限，或强制选 HLS 最高码率；自动档的码率上限由实时网速动态接管 */
+    private fun applyTrackParameters() {
+        if (!::trackSelector.isInitialized) return
+        adaptiveBitrateCap = -1
+        adaptiveUpgradeSamples = 0
+        val builder = trackSelector.buildUponParameters()
+            .setMaxVideoBitrate(Int.MAX_VALUE) // 先清掉上一次的网速自适应上限
+            .setForceHighestSupportedBitrate(prefs.quality == Prefs.QUALITY_HIGHEST)
+            .setAllowVideoMixedMimeTypeAdaptiveness(true)
+        when (prefs.quality) {
+            // 自动档：带宽充足时不人为压低清晰度，让 HLS ABR 挑到源提供的最高质量；
+            // 老盒子硬解 4K 极易卡死，按设备能力封顶 1080p；码率上限由 applyAdaptiveQuality() 按实时网速接管。
+            Prefs.QUALITY_AUTO -> {
+                if (DeviceProfile.info(this).tier != DeviceProfile.Tier.MODERN) {
+                    builder.setMaxVideoSize(1920, 1080)
+                }
+            }
+            Prefs.QUALITY_HIGHEST -> {
+                if (DeviceProfile.info(this).tier != DeviceProfile.Tier.MODERN) {
+                    builder.setMaxVideoSize(1920, 1080)
+                }
+            }
+            Prefs.QUALITY_1080 -> builder.setMaxVideoSize(1920, 1080)
+            Prefs.QUALITY_720 -> builder.setMaxVideoSize(1280, 720)
+            Prefs.QUALITY_480 -> builder.setMaxVideoSize(854, 480)
+            Prefs.QUALITY_SAVER -> {
+                builder.setMaxVideoSize(854, 480)
+                builder.setMaxVideoBitrate(800_000)
+            }
+        }
+        trackSelector.setParameters(builder)
+    }
+
+    // ------------------------------------------------------------ 卡顿兜底 / 网速自适应
+
+    /** 进入缓冲就排队 2 秒检查；恢复播放 / 换台 / 暂停时取消 */
+    private fun scheduleStallCheck() {
+        if (stallCheckPending || userPaused || mode != MODE_PLAYER) return
+        stallCheckPending = true
+        handler.removeCallbacks(stallCheckRunnable)
+        handler.postDelayed(stallCheckRunnable, STALL_SWITCH_DELAY)
+    }
+
+    private fun cancelStallCheck() {
+        stallCheckPending = false
+        handler.removeCallbacks(stallCheckRunnable)
+    }
+
+    /**
+     * 所有「延时自动切线路」统一走这里：记录播放会话代号，换台 / 离屏时撤销。
+     * 旧实现是匿名 Runnable，400ms 内换台后会把新频道静默切到备用源并污染线路偏好。
+     */
+    private fun postAutoLineSwitch(delayMs: Long) {
+        cancelAutoLineSwitch()
+        val generation = playbackGeneration
+        val task = Runnable {
+            pendingAutoLineSwitch = null
+            switchLinePending = false
+            audioSwitchPending = false
+            if (isFinishing || isDestroyed || mode != MODE_PLAYER || userPaused) return@Runnable
+            if (generation != playbackGeneration) return@Runnable
+            switchLine(1, silent = true)
+        }
+        pendingAutoLineSwitch = task
+        handler.postDelayed(task, delayMs)
+    }
+
+    private fun cancelAutoLineSwitch() {
+        pendingAutoLineSwitch?.let { handler.removeCallbacks(it) }
+        pendingAutoLineSwitch = null
+    }
+
+    /**
+     * 连续缓冲超过 2 秒的分级处理（1.9.5）：
+     * ① 还能降清晰度 → 先降一档码率上限，留在本线路继续播（网速恢复后自适应会再升回去）；
+     * ② 已到最低档仍卡 → 切换下一条备用线路；
+     * ③ 单线路 / 已试完 → 回到直播边缘重连。
+     * 降级冷却 4 秒、换源冷却 15 秒 + switchLinePending 去重，避免与 onPlayerError 叠加反复起播。
+     */
+    private fun onPlaybackStalled() {
+        stallCheckPending = false
+        if (isFinishing || mode != MODE_PLAYER || userPaused) return
+        if (!::player.isInitialized || player.playbackState != Player.STATE_BUFFERING) return
+        val channel = currentChannel ?: return
+        val now = SystemClock.elapsedRealtime()
+        val lines = channel.allUrls().size
+
+        // ① 优先降清晰度：留在本线路重试，给低码率一个恢复机会
+        when (tryDowngradeQualityOnStall(now)) {
+            1 -> {
+                Diagnostics.log(
+                    this, "STALL",
+                    "缓冲超过 2s · 降清晰度重试 | ${channel.name} | 线路=${currentLineIndex + 1}/$lines | " +
+                        "上限=${bitrateCapLabel(adaptiveBitrateCap)} | 网速=${formatNetSpeed(smoothedBps)}"
+                )
+                showPlayerOverlay()
+                setPlaybackStatus("卡顿超 2 秒 · 已降低清晰度重试…")
+                // 若 2 秒后仍在缓冲，继续走下一档（更低的码率或换源）
+                scheduleStallCheck()
+                return
+            }
+            2 -> {
+                // 两档降级之间还在 4 秒观察期：继续排队等待，绝不能提前换源
+                scheduleStallCheck()
+                return
+            }
+            else -> Unit // 已到最低档 / 用户手动锁档 → 进入换源分支
+        }
+
+        // 先判重：若已有一次自动切线路排队，绝不能提前消耗冷却，否则真正的卡顿会被压住
+        if (switchLinePending) {
+            scheduleStallCheck()
+            return
+        }
+
+        val canSwitch = prefs.autoSwitchLine && lines > 1 && lineSwitches < lines - 1
+        if (canSwitch) {
+            // ② 清晰度已到最低（或用户手动锁定画质档）仍卡 → 换源
+            // lastStallSwitchMs=0 表示从未发生，不能用 elapsedRealtime-0 误判冷却（开机 15 秒内必现）
+            if (lastStallSwitchMs > 0 && now - lastStallSwitchMs < STALL_SWITCH_COOLDOWN) {
+                scheduleStallCheck()
+                return
+            }
+            lastStallSwitchMs = now
+            Diagnostics.log(
+                this, "STALL",
+                "缓冲超过 2s · 最低清晰度仍卡，切换线路 | ${channel.name} | " +
+                    "线路=${currentLineIndex + 1}/$lines | 网速=${formatNetSpeed(smoothedBps)}"
+            )
+            lineSwitches++
+            switchLinePending = true
+            showPlayerOverlay()
+            setPlaybackStatus("卡顿超 2 秒 · 正在切换备用源…")
+            toast("最低清晰度仍卡顿，自动切换备用源")
+            postAutoLineSwitch(300L)
+        } else {
+            // ③ 单线路 / 已试完所有线路：回到直播边缘重连一次。
+            // 这里并没有「换源」，不该被 15 秒换源冷却卡住，单独用 4 秒冷却防死循环。
+            if (lastStallReconnectMs > 0 && now - lastStallReconnectMs < STALL_RECONNECT_COOLDOWN) {
+                scheduleStallCheck()
+                return
+            }
+            lastStallReconnectMs = now
+            Diagnostics.log(
+                this, "STALL",
+                "缓冲超过 2s · 无可换线路，回到直播边缘重连 | ${channel.name} | " +
+                    "网速=${formatNetSpeed(smoothedBps)}"
+            )
+            runCatching {
+                player.seekToDefaultPosition()
+                player.playWhenReady = true
+            }
+            showPlayerOverlay()
+            setPlaybackStatus("卡顿超 2 秒 · 正在重新连接…")
+            toast("卡顿超过 2 秒，已重新连接直播")
+        }
+    }
+
+    /**
+     * 默认画质档按实时下行网速选择「当前带宽能稳定播的最高清晰度」：
+     * 带宽充足时不设码率上限，让 HLS ABR 直接选到源提供的最高质量；
+     * 带宽不足时才按档位封顶。升档需连续 3 秒稳定，降档立即生效。
+     * 用户手动指定了 1080p / 720p / 省流等档位时完全尊重手动选择。
+     */
+    private fun applyAdaptiveQuality() {
+        if (!::trackSelector.isInitialized || !::player.isInitialized) return
+        if (prefs.quality != Prefs.QUALITY_AUTO || mode != MODE_PLAYER || userPaused) return
+        if (netSpeedSamples < 2 || smoothedBps <= 0) return
+        // 字节/秒 → bit/秒，留 25% 余量给音频、分片开销与网络波动；
+        // 参考缓慢衰减的历史峰值，避免码率被压低后测得速率变小、清晰度升不回去
+        val effectiveBps = maxOf(smoothedBps, peakBps * 0.85)
+        val safeBps = (effectiveBps * 8.0 * 0.75).toLong()
+        val target = bitrateCapFor(safeBps)
+        val current = adaptiveBitrateCap
+        if (target == current) {
+            adaptiveUpgradeSamples = 0
+            return
+        }
+        val isUpgrade = current >= 0 &&
+            (target == Int.MAX_VALUE || (current != Int.MAX_VALUE && target > current))
+        if (isUpgrade) {
+            // 卡顿降档后 20 秒内不自动升档，避免「降 → 升 → 又卡 → 再降」来回抖
+            if (SystemClock.elapsedRealtime() < adaptiveUpgradeHoldUntil) return
+            if (++adaptiveUpgradeSamples < 3) return
+        } else {
+            adaptiveUpgradeSamples = 0
+        }
+        setAdaptiveBitrateCap(target)
+    }
+
+    private fun bitrateCapFor(bitsPerSec: Long): Int = when {
+        bitsPerSec < 1_200_000L -> 800_000
+        bitsPerSec < 2_500_000L -> 1_800_000
+        bitsPerSec < 4_500_000L -> 3_200_000
+        bitsPerSec < 8_000_000L -> 6_000_000
+        bitsPerSec < 15_000_000L -> 12_000_000
+        else -> Int.MAX_VALUE
+    }
+
+    private fun setAdaptiveBitrateCap(cap: Int) {
+        adaptiveBitrateCap = cap
+        // 每次真正换档后都要重新累计「连续 3 秒稳定」，否则第二次升档 1 秒就跳一档
+        adaptiveUpgradeSamples = 0
+        trackSelector.setParameters(
+            trackSelector.buildUponParameters().setMaxVideoBitrate(cap)
+        )
+        Diagnostics.log(
+            this, "QUALITY",
+            "网速自适应上限 " +
+                (if (cap == Int.MAX_VALUE) "不限制（源最高清晰度）" else "${cap / 1000} kbps") +
+                " | 实测 ${formatNetSpeed(smoothedBps)}"
+        )
+    }
+
+    /**
+     * 卡顿时沿码率阶梯（3.2M → 1.8M → 800k）逐级下调一档并留在本线路重试。
+     * 返回：1=本次已降档；2=还在 4 秒观察期（继续等待，不能换源）；
+     * 0=已是最低档或用户手动锁定画质档（由调用方进入换源分支）。
+     * 自动档网速自适应之后仍会按带宽把这档上限升回去。
+     */
+    private fun tryDowngradeQualityOnStall(now: Long): Int {
+        if (prefs.quality != Prefs.QUALITY_AUTO || !::trackSelector.isInitialized) return 0
+        val current = adaptiveBitrateCap
+        val next = when {
+            // 尚未设上限（起播初期网速样本不足）：直接落到 3.2Mbps 档试
+            current < 0 -> 3_200_000
+            current == Int.MAX_VALUE || current > 3_200_000 -> 3_200_000
+            current > 1_800_000 -> 1_800_000
+            current > 800_000 -> 800_000
+            else -> return 0 // 已是最低档
+        }
+        if (lastStallDowngradeMs > 0 && now - lastStallDowngradeMs < STALL_DOWNGRADE_COOLDOWN) return 2
+        lastStallDowngradeMs = now
+        adaptiveUpgradeSamples = 0
+        adaptiveUpgradeHoldUntil = now + 20_000L
+        setAdaptiveBitrateCap(next)
+        return 1
+    }
+
+    /** 码率上限的可读标签，供信息与日志使用 */
+    private fun bitrateCapLabel(cap: Int): String =
+        when {
+            cap < 0 -> "未设定"
+            cap == Int.MAX_VALUE -> "不限制"
+            else -> "${cap / 1000} kbps"
+        }
+
+    /** 从设置页 / 手机后台返回时调用：画质、请求头即时生效，引擎变化即时重播 */
+    private fun applyPlayerSettings() {
+        if (!::player.isInitialized || !::trackSelector.isInitialized) return
+        applyTrackParameters()
+        httpFactory.setDefaultRequestProperties(repository.allHeaders())
+
+        val externalNow = if (prefs.isExternalEngine) 1 else 0
+        val externalChanged = lastEngineMode != -1 && lastEngineMode != externalNow
+        lastEngineMode = externalNow
+        val channel = currentChannel
+
+        if (prefs.isFastEngine != fastBufferMode) {
+            // 缓冲档位变化必须重建播放器：先解绑监听与 surface，避免旧实例残留回调
+            runCatching { player.removeListener(playerListener) }
+            playerView.player = null
+            player.release()
+            setupPlayer()
+            channel?.let { playChannel(it, enterPlayer = mode == MODE_PLAYER) }
+            return
+        }
+        // 修复：切到 VLC / MX / Kodi（或切回内置）后要等下次换台才生效的问题
+        if (externalChanged && channel != null && mode == MODE_PLAYER) {
+            playChannel(channel, enterPlayer = false)
+        }
+    }
+
+    private fun buildMediaItem(url: String): MediaItem {
+        val builder = MediaItem.Builder().setUri(Uri.parse(url))
+        if (url.contains(".m3u8", ignoreCase = true)) {
+            builder.setMimeType(MimeTypes.APPLICATION_M3U8)
+        }
+        if (prefs.isFastEngine) {
+            builder.setLiveConfiguration(
+                MediaItem.LiveConfiguration.Builder()
+                    .setTargetOffsetMs(3000L)
+                    .setMinPlaybackSpeed(1.0f)
+                    .setMaxPlaybackSpeed(1.06f)
+                    .build()
+            )
+        }
+        return builder.build()
+    }
+
+    // ------------------------------------------------------------ 卡片预览小窗
+
+    /** 按需创建唯一的预览播放器与 surface；关闭预览时彻底释放解码器 */
+    private fun ensurePreviewPlayer(): ExoPlayer? {
+        if (!previewAllowed()) return null
+        previewPlayer?.let { return it }
+
+        val selector = DefaultTrackSelector(this)
+        selector.setParameters(
+            selector.buildUponParameters()
+                .setForceLowestBitrate(true)
+                .setMaxVideoSize(640, 360)
+                .setMaxVideoBitrate(500_000)
+                // 预览只出画面：彻底关掉音轨，避免和小窗播放器抢音频输出/音频焦点
+                .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+        )
+        val renderers = DefaultRenderersFactory(this)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
+            .setEnableDecoderFallback(false)
+        val p = ExoPlayer.Builder(this, renderers)
+            .setTrackSelector(selector)
+            .setLoadControl(
+                DefaultLoadControl.Builder()
+                    .setBufferDurationsMs(2000, 6000, 400, 1000)
+                    .setPrioritizeTimeOverSizeThresholds(true)
+                    .build()
+            )
+            .setMediaSourceFactory(
+                DefaultMediaSourceFactory(DefaultDataSource.Factory(this, httpFactory))
+            )
+            .build()
+        // 预览是静音小窗：既不申请音频焦点、也不打开音频输出，
+        // 否则会把主播放器的音频焦点抢走，导致正片画面正常但没声音
+        p.setAudioAttributes(AudioAttributes.DEFAULT, /* handleAudioFocus= */ false)
+        p.volume = 0f
+        p.addListener(object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                // 只把「这一条线路」记为坏源，并尝试同一频道的备用线路继续出画面。
+                // 旧版累计 3 次失败就 releasePreviewPlayer()，试过几个死链后所有频道的
+                // 悬停预览都失效 —— 这正是「部分光标对到实时预览失效」的主因之一。
+                activePreviewUrl?.let { previewFailedUrls.add(it) }
+                val next = previewChannel?.allUrls()
+                    ?.firstOrNull { it.isNotBlank() && it !in previewFailedUrls }
+                if (next != null && activePreviewHost != null && !previewRetryPending) {
+                    previewRetryPending = true
+                    handler.post {
+                        previewRetryPending = false
+                        if (activePreviewHost != null) playPreviewUrl(next)
+                    }
+                    return
+                }
+                hideActivePreview()
+                previewFailures++
+                if (previewFailures >= 6) {
+                    previewFailures = 0
+                    toast("部分源预览不可用，已跳过这些线路；其它频道预览不受影响")
+                }
+            }
+
+            /**
+             * 首帧真正渲染出来后才把预览小窗显示出来。
+             * 之前是聚焦就立刻铺上 PlayerView（此时是黑色 shutter），把卡片的静态封面盖掉了，
+             * 表现为「鼠标一移到卡片上，封面就消失」；死链时更是永远黑块。
+             */
+            override fun onRenderedFirstFrame() {
+                if (previewPlayer !== p) return
+                previewFailures = 0
+                val surface = previewSurface ?: return
+                val host = activePreviewHost ?: return
+                if (surface.parent !== host) return
+                surface.animate().cancel()
+                surface.animate().alpha(1f).setDuration(130).start()
+                (host.parent as? View)?.findViewById<View>(R.id.previewTag)?.visibility = View.VISIBLE
+            }
+        })
+        previewPlayer = p
+
+        val surface = layoutInflater.inflate(
+            R.layout.preview_surface, null, false
+        ) as PlayerView
+        // 透明遮罩 + 透明起始透明度：加载期间看到的是卡片自己的封面/台标，而不是黑块
+        surface.setShutterBackgroundColor(Color.TRANSPARENT)
+        surface.useController = false
+        surface.alpha = 0f
+        previewSurface = surface
+        return p
+    }
+
+    private fun onCardFocus(channel: Channel?, host: FrameLayout?, fromHover: Boolean) {
+        // 自己维护「鼠标停在哪张卡」，不依赖 ROM 的 View.isHovered
+        if (fromHover) hoveredHost = host
+
+        if (channel == null || host == null) {
+            // 鼠标/飞鼠仍悬停在卡片上时，忽略遥控器焦点抖动导致的「失焦」回调
+            if (!fromHover && hoveredHost != null) return
+            hoveredHost = null
+            cancelPendingPreview()
+            stopPreview()
+            return
+        }
+
+        // host 是 RecyclerView 复用的同一个 View 对象。若已被重新绑定给别的频道，
+        // 即使对象相同也必须当成新卡重新排队，否则会命中旧的「已在播/已排队」直接跳过。
+        // 配合 onHostRecycled 清状态，解决「滚动后部分卡片悬停预览失效」。
+        val rebound = (host.tag as? String)?.let { it != channel.url } ?: false
+        if (!rebound && (host === activePreviewHost || host === pendingPreviewHost)) return
+
+        cancelPendingPreview()
+        stopPreview()
+        host.tag = channel.url
+        if (mode != MODE_WALL || !previewAllowed() || channel.url.isBlank()) return
+
+        val runnable = Runnable {
+            pendingPreviewHost = null
+            startPreview(channel, host)
+        }
+        previewRunnable = runnable
+        pendingPreviewHost = host
+        handler.postDelayed(runnable, PREVIEW_DELAY)
+    }
+
+    /** 卡片被回收：清掉所有指向这个 host 的状态，避免复用后预览永远起不来 */
+    private fun onHostRecycled(host: FrameLayout) {
+        if (hoveredHost === host) hoveredHost = null
+        if (pendingPreviewHost === host) cancelPendingPreview()
+        if (activePreviewHost === host) stopPreview()
+    }
+
+    /** 预览只看独立开关；封面模式只管静态封面，两者互不干扰 */
+    private fun previewAllowed(): Boolean = prefs.previewEnabled
+
+    private fun cancelPendingPreview() {
+        previewRunnable?.let { handler.removeCallbacks(it) }
+        previewRunnable = null
+        pendingPreviewHost = null
+        previewRetryPending = false
+    }
+
+    private fun startPreview(channel: Channel, host: FrameLayout) {
+        if (mode != MODE_WALL || !previewAllowed() || !host.isAttachedToWindow) return
+        if (host === activePreviewHost) return
+        val parent = host.parent as? View
+        // 遥控器场景看焦点；鼠标/飞鼠看我们显式记录的 hoveredHost。
+        val staysOnCard = parent == null || parent.hasFocus() || host === hoveredHost
+        if (!staysOnCard) return
+        // 后台还在放直播时绝不开第二路解码器
+        if (prefs.backgroundPlay && player.isPlaying) return
+
+        val p = ensurePreviewPlayer() ?: return
+        val surface = previewSurface ?: return
+
+        // 订阅源里死链很多：跳过已确认预览失败的线路，直接用能出画面的那条
+        val url = channel.allUrls()
+            .firstOrNull { it.isNotBlank() && it !in previewFailedUrls } ?: return
+
+        detachPreviewSurface()
+
+        surface.alpha = 0f
+        surface.player = p
+        host.addView(surface)
+        host.visibility = View.VISIBLE
+        activePreviewHost = host
+        activePreviewUrl = url
+        previewChannel = channel
+        channelAdapter.activePreviewHost = host
+        playPreviewUrl(url)
+    }
+
+    /** 换一条线路继续预览：不摘 surface，避免反复闪出黑块 */
+    private fun playPreviewUrl(url: String) {
+        val p = previewPlayer ?: return
+        activePreviewUrl = url
+        p.stop()
+        p.setMediaItem(buildMediaItem(url))
+        p.prepare()
+        p.playWhenReady = true
+    }
+
+    private fun detachPreviewSurface() {
+        val surface = previewSurface
+        if (surface != null) {
+            runCatching { surface.player = null }
+            surface.alpha = 0f
+            (surface.parent as? FrameLayout)?.let { oldHost ->
+                oldHost.removeView(surface)
+                oldHost.visibility = View.GONE
+                (oldHost.parent as? View)?.findViewById<View>(R.id.previewTag)?.visibility = View.GONE
+            }
+        }
+        val host = activePreviewHost
+        if (host != null) {
+            host.visibility = View.GONE
+            (host.parent as? View)?.findViewById<View>(R.id.previewTag)?.visibility = View.GONE
+        }
+        activePreviewHost = null
+        activePreviewUrl = null
+        channelAdapter.activePreviewHost = null
+    }
+
+    private fun stopPreview() {
+        cancelPendingPreview()
+        detachPreviewSurface()
+        previewPlayer?.let {
+            it.stop()
+            it.clearMediaItems()
+        }
+    }
+
+    private fun hideActivePreview() {
+        detachPreviewSurface()
+    }
+
+    private fun releasePreviewPlayer() {
+        stopPreview()
+        previewPlayer?.release()
+        previewPlayer = null
+        previewSurface = null
+        previewFailures = 0
+    }
+
+    // ------------------------------------------------------------ 数据
+
+    private fun reloadPlaylist(preservePage: Boolean = false, autoPlayLast: Boolean = false) {
+        if (loadingSource) {
+            pendingReload = true
+            return
+        }
+        if (!repository.hasSources) {
+            openSettings()
+            return
+        }
+        loadingSource = true
+        countView.text = "加载中…"
+        sourceLabelView.text = repository.label()
+        httpFactory.setDefaultRequestProperties(repository.allHeaders())
+        emptyHint.visibility = View.VISIBLE
+        emptyHint.text = "正在加载播放源 / 接口…"
+
+        ioExecutor.execute {
+            val result = runCatching { repository.load() }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                loadingSource = false
+                val savedPage = if (preservePage) currentPage else null
+                // load() 里可能刚刷新过 Token，播放请求头要同步更新
+                httpFactory.setDefaultRequestProperties(repository.allHeaders())
+                result.onSuccess { list ->
+                    bindChannels(list)
+                    // bindChannels 会按「上次观看频道」重算页码，这里恢复到用户离开前的页
+                    if (savedPage != null) {
+                        currentPage = savedPage.coerceIn(0, pageCount() - 1)
+                        applyPage(focusFirst = false)
+                    }
+                    // 冷启动：列表就绪后直接进入上次播放的频道全屏播放（只做一次）
+                    if (autoPlayLast) autoPlayLastChannel()
+                }.onFailure { error ->
+                    emptyHint.visibility = View.VISIBLE
+                    emptyHint.text =
+                        "加载播放源失败：${error.message ?: "未知错误"}\n\n点右上角「设置」检查地址，或确认设备已联网"
+                    countView.text = "${allChannels.size} 个频道"
+                }
+                if (pendingReload) {
+                    pendingReload = false
+                    reloadPlaylist()
+                }
+            }
+        }
+    }
+
+    private fun bindChannels(list: List<Channel>) {
+        // 订阅源里混杂组播 TS / 需登录接口等不可播线路：把 HLS 线路提到主线路，
+        // 让默认第一条就尽量能播（备用线路全部保留，换源菜单仍可手动选）
+        allChannels = list.map { it.withPreferredLine() }
+        // 每次重新加载播放源都重新评估失败隐藏：清零累计次数并刷新隐藏快照
+        channelFailures.clear()
+        previewFailedUrls.clear()
+        hiddenSnapshot = if (prefs.hideFailedChannels) prefs.hiddenChannels else emptySet()
+        buildGroups()
+        // 默认进入「最近观看」：上千频道时不必从「全部」第一条一路往上翻。
+        // 用户手动选过分组后尊重其选择；换源导致分组消失时才回退到「全部」。
+        if (!userPickedGroup) {
+            activeGroup = defaultStartGroup()
+        } else if (!groupAdapter.hasGroup(activeGroup)) {
+            activeGroup = null
+        }
+        // 整列表模式：定位到上次观看频道的绝对位置并滚入可见区
+        val target = allChannels.getOrNull(repository.lastIndex) ?: allChannels.firstOrNull()
+        applyFilter(focusFirst = false, targetChannel = target)
+        updateNowPlayingChip()
+        val index = target?.let { ch -> filteredChannels.indexOfFirst { it.url == ch.url } } ?: -1
+        if (index >= 0) focusCard(index)
+        else if (filteredChannels.isNotEmpty()) focusCard(0)
+    }
+
+    private fun buildGroups() {
+        val groups = LinkedHashSet<String>()
+        // 「★ 我的收藏」固定排在「⏱ 最近观看」之前，两个虚拟分组始终可见：
+        // 即使还没有收藏 / 观看记录，也能直接找到入口并看到明确的空状态提示。
+        groups.add(Library.GROUP_FAVORITE)
+        groups.add(Library.GROUP_RECENT)
+        for (channel in allChannels) {
+            val group = channel.group
+            if (!group.isNullOrBlank()) groups.add(group)
+        }
+        groupAdapter.submit(groups.toList())
+        groupAdapter.setSelected(activeGroup)
+        // 换源后横滑导航自动定位到当前选中分类
+        scrollGroupToSelection()
+        groupListView.visibility = if (groups.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun selectGroup(group: String?) {
+        if (group == activeGroup) return
+        userPickedGroup = true
+        activeGroup = group
+        cancelSelectionQuiet()
+        applyFilter(focusFirst = false, targetChannel = null, resetPage = true)
+        gridView.postDelayed({ focusCard(0) }, 150)
+    }
+
+    /** 启动默认分组：有观看记录就进「最近观看」，第一次使用仍进「全部」 */
+    private fun defaultStartGroup(): String? =
+        if (prefs.recentKeys.isNotEmpty()) Library.GROUP_RECENT else null
+
+    /** 分组条把当前选中的分类滚进可见区域，默认落在最近观看时能看到高亮 */
+    private fun scrollGroupToSelection() {
+        groupListView.post {
+            runCatching { groupListView.scrollToPosition(groupAdapter.selectedPosition()) }
+        }
+    }
+
+    /**
+     * 计算当前分组的完整结果，再交给 applyPage() 只显示其中一页（3 行）。
+     * targetChannel 用来定位上次观看 / 当前播放频道所在的页；resetPage 强制回第一页。
+     */
+    private fun applyFilter(
+        focusFirst: Boolean,
+        targetChannel: Channel? = currentChannel,
+        resetPage: Boolean = false,
+        keepPage: Int? = null,
+        exitSelection: Boolean = true
+    ) {
+        // 开启过滤时，把累计播放失败已被隐藏的频道从列表里剔除
+        val hidden = if (prefs.hideFailedChannels) hiddenSnapshot else emptySet()
+        val visible = if (hidden.isEmpty()) allChannels
+        else allChannels.filter { it.stableKey() !in hidden }
+        filteredChannels = when (activeGroup) {
+            null -> visible
+            Library.GROUP_FAVORITE -> visible.filter { prefs.isFavorite(it.stableKey()) }
+            Library.GROUP_RECENT -> {
+                val order = HashMap<String, Int>()
+                prefs.recentKeys.forEachIndexed { index, key -> order[key] = index }
+                visible.filter { order.containsKey(it.stableKey()) }
+                    .sortedBy { order[it.stableKey()] ?: Int.MAX_VALUE }
+            }
+            else -> visible.filter { it.group == activeGroup }
+        }
+        if (exitSelection) cancelSelectionQuiet()
+        val targetIndex = targetChannel?.let { ch ->
+            filteredChannels.indexOfFirst { it.url == ch.url }
+        } ?: -1
+        currentPage = when {
+            keepPage != null -> keepPage
+            !resetPage && targetIndex >= 0 -> targetIndex / pageSize()
+            else -> 0
+        }
+        groupAdapter.setSelected(activeGroup)
+        scrollGroupToSelection()
+        applyPage(focusFirst)
+    }
+
+    private fun focusCard(position: Int) {
+        val target = position.coerceIn(0, (channelAdapter.itemCount - 1).coerceAtLeast(0))
+        // 整列表模式：先把目标滚进可见区，再请求焦点
+        if (position >= 0 && channelAdapter.itemCount > 0) gridView.scrollToPosition(target)
+        gridView.postDelayed({
+            val holder = gridView.findViewHolderForAdapterPosition(target)
+            if (holder != null) holder.itemView.requestFocus() else gridView.requestFocus()
+        }, 120)
+    }
+
+    private fun focusCurrentCard() {
+        val channel = currentChannel ?: return
+        val index = filteredChannels.indexOfFirst { it.url == channel.url }
+        if (index < 0) {
+            focusCard(0)
+            return
+        }
+        // 整列表模式下直接滚动到该频道的绝对位置，并让它可见
+        gridView.scrollToPosition(index)
+        // 位置换算回 currentPage，保证下次 applyPage 定位一致
+        val targetPage = index / pageSize().coerceAtLeast(1)
+        currentPage = targetPage.coerceIn(0, pageCount() - 1)
+        focusCard(index)
+    }
+
+    private fun focusedChannel(): Channel? {
+        val child = gridView.focusedChild ?: return null
+        val position = gridView.getChildAdapterPosition(child)
+        if (position == RecyclerView.NO_POSITION) return null
+        return channelAdapter.channelAt(position)
+    }
+
+    /** 长按 OK（或收藏键 / 底部 ★ 按钮）切换收藏；节目单保持显示并即时刷新星标 */
+    private fun toggleFavorite(channel: Channel) {
+        val added = prefs.toggleFavorite(channel.stableKey())
+        buildGroups()
+        when {
+            // 节目单可见时绝不重排墙面、不抢焦点、不关闭节目单：
+            // 只刷新列表行的 ★/☆，长按收藏 / 再长按取消都能原地看到变化。
+            epgVisible -> {
+                epgAdapter.refreshGuide()
+                updateEpgDetail()
+                channelAdapter.notifyDataSetChanged()
+            }
+            Library.isVirtual(activeGroup) -> {
+                // 收藏不改变「最近观看」列表内容，不能顺带退出多选并清空跨页勾选
+                applyFilter(focusFirst = false, keepPage = currentPage, exitSelection = false)
+                if (!channelAdapter.isSelectionMode()) focusCard(0)
+            }
+            else -> channelAdapter.notifyDataSetChanged()
+        }
+        refreshBottomButtons()
+        toast(if (added) "★ 已收藏：${channel.name}" else "已取消收藏：${channel.name}")
+    }
+
+    // ------------------------------------------------------------ 播放控制
+
+    private fun playChannel(channel: Channel, enterPlayer: Boolean = true) {
+        if (channel.url.isBlank()) {
+            toast("该频道没有可用的播放地址")
+            return
+        }
+
+        currentResolution = null
+        showChannelInfo(channel)
+        if (epgVisible) syncEpgToCurrent()
+
+        if (prefs.isExternalEngine && launchExternalPlayer(channel)) {
+            currentChannel = channel
+            channelAdapter.setCurrent(channel.url)
+            updateNowPlayingChip()
+            repository.lastIndex = channel.number - 1
+            prefs.recordRecent(channel.stableKey())
+            prefs.lastPlayedKey = channel.stableKey()
+            return
+        }
+
+        currentChannel = channel
+        currentLineIndex = prefs.lineIndexFor(channel.stableKey())
+            .coerceIn(0, (channel.allUrls().size - 1).coerceAtLeast(0))
+        lineSwitches = 0
+        audioSwitches = 0
+        audioSwitchPending = false
+        switchLinePending = false
+        cancelAutoLineSwitch()
+        audioUnsupportedNotified = false
+        timeshiftStart = null
+        channelAdapter.setCurrent(channel.url)
+        updateNowPlayingChip()
+
+        infoMetaView.text = metaOf(channel)
+        setPlaybackStatus(null)
+        errorView.visibility = View.GONE
+
+        userPaused = false
+        startPlayback(channel)
+
+        repository.lastIndex = channel.number - 1
+        prefs.recordRecent(channel.stableKey())
+        prefs.lastPlayedKey = channel.stableKey()
+        if (enterPlayer) {
+            enterPlayerMode()
+        } else if (mode == MODE_WALL) {
+            // 设置变更等原因在墙面重播：控制条不能浮出来压住频道墙
+            if (::playerControls.isInitialized) playerControls.visibility = View.GONE
+            channelInfoCard.visibility = View.GONE
+            bottomInfoBar.visibility = View.GONE
+            hintView.visibility = View.GONE
+            focusCurrentCard()
+        }
+    }
+
+    /** 用当前线路 + 当前时移状态起播；切线路、回看、自动重试都走这里 */
+    private fun startPlayback(channel: Channel) {
+        val urls = channel.allUrls()
+        if (urls.isEmpty()) return
+        currentLineIndex = currentLineIndex.coerceIn(0, urls.lastIndex)
+        val liveUrl = urls[currentLineIndex]
+        val start = timeshiftStart
+        val url = if (start != null) Catchup.build(channel, start, liveUrl) ?: liveUrl else liveUrl
+        preparePlayback(buildMediaItem(url), url)
+        infoMetaView.text = metaOf(channel) + playbackSuffix(channel, start)
+        updateInfoExtra()
+    }
+
+    private fun playbackSuffix(channel: Channel, start: Long?): String = buildString {
+        if (channel.hasMultiLine()) {
+            append("   ·   ").append(channel.lineLabel(currentLineIndex))
+                .append(" ").append(currentLineIndex + 1).append("/")
+                .append(channel.allUrls().size)
+        }
+        if (start != null) append("   ·   时移 ").append(Catchup.clock(start))
+    }
+
+    /** 手动 / 自动切到相邻线路 */
+    private fun switchLine(delta: Int, silent: Boolean = false) {
+        val channel = currentChannel ?: return
+        val urls = channel.allUrls()
+        if (urls.size < 2) {
+            if (!silent) toast("${channel.name} 只有 1 条线路")
+            return
+        }
+        currentLineIndex = ((currentLineIndex + delta) % urls.size + urls.size) % urls.size
+        prefs.setLineIndex(channel.stableKey(), currentLineIndex)
+        if (!silent) {
+            toast("${channel.name}　${channel.lineLabel(currentLineIndex)}（${currentLineIndex + 1}/${urls.size}）")
+        }
+        errorView.visibility = View.GONE
+        setPlaybackStatus(null)
+        startPlayback(channel)
+    }
+
+    /**
+     * 换源菜单：多订阅里同名频道已合并成一张卡片，这里列出全部线路
+     * （主线路在最前，其余为其他订阅的备用源），可直接选一个播。
+     */
+    /** 1.9.3 起长按 OK 改为收藏，换源统一走底部信息栏「线路」按钮；此菜单保留为备用入口 */
+    @Suppress("unused")
+    private fun showLinePicker() {
+        if (linePickerOpen) return
+        val channel = currentChannel ?: return
+        val lines = channel.lines()
+        if (lines.size < 2) {
+            toast("${channel.name} 只有 1 条线路")
+            return
+        }
+        val labels = lines.mapIndexed { index, line ->
+            val name = channel.lineLabel(index)
+            val host = runCatching { android.net.Uri.parse(line.first).host.orEmpty() }
+                .getOrDefault("")
+            val mark = if (index == currentLineIndex) "●　" else "　　"
+            "$mark${index + 1}. $name" + if (host.isNotBlank() && host != name) "   $host" else ""
+        }.toTypedArray()
+
+        linePickerOpen = true
+        android.app.AlertDialog.Builder(this)
+            .setTitle("换源 · ${channel.name}")
+            .setItems(labels) { _, which ->
+                currentLineIndex = which
+                prefs.setLineIndex(channel.stableKey(), which)
+                lineSwitches = 0
+                errorView.visibility = View.GONE
+                setPlaybackStatus(null)
+                startPlayback(channel)
+                toast("已换到 ${channel.lineLabel(which)}（${which + 1}/${lines.size}）")
+            }
+            .setNegativeButton("取消", null)
+            .setOnDismissListener { linePickerOpen = false }
+            .showFitting()
+    }
+
+    /** 回看 / 时移菜单：快捷档位 + XMLTV 最近播过的节目 */
+    private fun showTimeshiftMenu() {
+        val channel = currentChannel
+        if (channel == null) {
+            toast("请先播放一个频道")
+            return
+        }
+        if (!channel.canCatchup()) {
+            toast("该频道没有可直连的 http 地址，无法时移")
+            return
+        }
+        val options = Catchup.options(channel, epg)
+        val labels = options.map { it.label }.toTypedArray()
+        android.app.AlertDialog.Builder(this)
+            .setTitle("回看 / 时移 · ${channel.name}")
+            .setMessage(Catchup.hint(channel))
+            .setItems(labels) { _, which ->
+                val picked = options.getOrNull(which) ?: return@setItems
+                timeshiftStart = if (picked.start <= 0L) null else picked.start
+                lineSwitches = 0
+                startPlayback(channel)
+                toast(
+                    if (timeshiftStart == null) "已回到直播"
+                    else "时移：${Catchup.clock(timeshiftStart!!)}　（源不支持会提示播放失败）"
+                )
+            }
+            .setNegativeButton("取消", null)
+            .showFitting()
+    }
+
+    /** 打开 EPG 时间轴网格 */
+    private fun openEpgGrid() {
+        if (allChannels.isEmpty()) {
+            toast("还没有频道，点右上角「设置」添加播放源")
+            return
+        }
+        EpgGridActivity.pendingChannels = allChannels
+        EpgGridActivity.pendingEpg = epg
+        val index = currentChannel?.let { c ->
+            allChannels.indexOfFirst { it.url == c.url }.takeIf { it >= 0 }
+        } ?: epgIndex
+        EpgGridActivity.pendingIndex = index.coerceIn(0, allChannels.size - 1)
+        @Suppress("DEPRECATION")
+        startActivityForResult(
+            Intent(this, EpgGridActivity::class.java), REQUEST_EPG_GRID
+        )
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == REQUEST_EPG_GRID && resultCode == android.app.Activity.RESULT_OK) {
+            val index = data?.getIntExtra(EpgGridActivity.EXTRA_PLAY_INDEX, -1) ?: -1
+            allChannels.getOrNull(index)?.let { playChannel(it) }
+        }
+    }
+
+    private fun playNeighbor(delta: Int) {
+        val playable = allChannels.filter { it.url.isNotBlank() }
+        if (playable.isEmpty()) {
+            toast("还没有可直连的源，点右上角「设置」添加")
+            return
+        }
+        val current = currentChannel
+        val index = if (current == null) -1 else playable.indexOfFirst { it.url == current.url }
+        val size = playable.size
+        val next = if (index < 0) 0 else ((index + delta) % size + size) % size
+        playChannel(playable[next], enterPlayer = mode == MODE_PLAYER)
+    }
+
+    private fun launchExternalPlayer(channel: Channel): Boolean {
+        // 修复：外部播放器之前永远只拿主线路，用户手动选中的备用线路会被忽略
+        val urls = channel.allUrls()
+        val idx = prefs.lineIndexFor(channel.stableKey())
+            .coerceIn(0, (urls.size - 1).coerceAtLeast(0))
+        val target = urls.getOrNull(idx) ?: channel.url
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(Uri.parse(target), "video/*")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val pkg = prefs.externalPackage
+        if (pkg != null) {
+            intent.setPackage(pkg)
+            if (pkg == Prefs.PACKAGE_MX_FREE && intent.resolveActivity(packageManager) == null) {
+                intent.setPackage(Prefs.PACKAGE_MX_PRO)
+            }
+        }
+        if (intent.resolveActivity(packageManager) == null) {
+            toast("未找到所选播放器，已回退内置播放器")
+            return false
+        }
+        return try {
+            player.pause()
+            startActivity(intent)
+            toast("已交给外部播放器：${channel.name}")
+            true
+        } catch (ignored: Exception) {
+            toast("外部播放器启动失败，已回退内置播放器")
+            false
+        }
+    }
+
+    private fun playByNumber(number: Int) {
+        val channel = allChannels.firstOrNull { it.number == number }
+        if (channel == null) {
+            toast("没有 CH $number（当前共 ${allChannels.size} 个频道）")
+            return
+        }
+        if (epgVisible) hideEpg()
+        playChannel(channel)
+    }
+
+    // ------------------------------------------------------------ 信息卡 / 节目单
+
+    /**
+     * 换台：显示合并后的唯一信息卡 + 底部信息栏，统一 5 秒后收起。
+     * 本函数在 currentChannel 赋值之前就会被调用，所以填充内容一律用入参 channel，
+     * 不能读 currentChannel / currentLineIndex（会是上一个频道的值）。
+     */
+    private fun showChannelInfo(channel: Channel) {
+        showPlayerOverlay(channel)
+        showBottomInfo(channel)
+    }
+
+    /** 填充右上角唯一信息卡（尺寸仍是 280×152dp）：状态 / 频道号·线路 / 频道名 / 元信息 / 节目 / 时间·网速 */
+    private fun fillChannelInfoCard(channel: Channel) {
+        val urls = channel.allUrls()
+        val lineIndex = prefs.lineIndexFor(channel.stableKey())
+            .coerceIn(0, (urls.size - 1).coerceAtLeast(0))
+        infoNumberView.text = buildString {
+            append("CH ").append(channel.number.toString().padStart(2, '0'))
+            if (urls.size > 1) {
+                append("　·　线路 ").append(lineIndex + 1).append("/").append(urls.size)
+            }
+        }
+        infoNameView.text = channel.name
+        infoMetaView.text = metaOf(channel)
+        updateInfoExtra()
+        updateInfoProgram(channel)
+        infoTimeView.text = clockText()
+    }
+
+    /** 卡片与底部栏共用的「当前时间 · 分辨率」，由网速采样每秒顺带刷新 */
+    private fun clockText(): String = buildString {
+        append(SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date()))
+        currentResolution?.takeIf { it.isNotBlank() }?.let { append("　·　").append(it) }
+    }
+
+    private fun updateInfoExtra() {
+        val channel = currentChannel ?: return
+        val tags = ArrayList<String>()
+        if (channel.url.contains(".m3u8", true)) tags.add("HLS")
+        tags.add(
+            when {
+                prefs.isExternalEngine -> "外部播放器"
+                prefs.isFastEngine -> "内置加速"
+                else -> "内置播放"
+            }
+        )
+        currentResolution?.let { tags.add(it) }
+        infoExtraView.text = tags.joinToString(" · ")
+    }
+
+    /** 当前节目（时间段 + 剩余分钟 + 节目名）与下一个节目，参考 TV 播放器信息栏 */
+    private fun updateInfoProgram(channel: Channel? = currentChannel) {
+        val ch = channel ?: return
+        val now = epg.anchorNow()
+        val current = epg.current(ch)
+        val next = epg.upcoming(ch, 1).firstOrNull()
+
+        infoGroupView.text = if (current != null) {
+            val left = ((current.stop - now) / 60_000L).coerceAtLeast(0)
+            "${current.timeRange()}　·　剩 ${left} 分钟"
+        } else {
+            "暂无节目单"
+        }
+
+        infoProgramView.visibility = View.VISIBLE
+        infoProgramView.text = current?.title
+            ?: next?.let { "即将  ${it.title}" }
+            ?: "—"
+
+        val nextLine = next?.let { "接下来  ${it.timeRange()}　${it.title}" }.orEmpty()
+        infoNextView.visibility = if (nextLine.isBlank()) View.GONE else View.VISIBLE
+        infoNextView.text = nextLine
+        // 节目单异步加载完成后，底部栏的时间段 / 进度 / 下一个节目也跟着刷新
+        updateBottomProgram(ch)
+    }
+
+    // ------------------------------------------------------------ 底部频道信息栏
+
+    /** 手机版：底部信息栏已停用，换台信息由 showPlayerOverlay 填进标准控制条。
+     *  保留此方法仅供既有调用点兼容（切线路等），不显示任何旧浮层。 */
+    private fun showBottomInfo(channel: Channel) {
+        if (!::playerControls.isInitialized) return
+        fillPlayerControls(channel)
+        scheduleInfoHide()
+    }
+
+    private fun bindBottomLogo(channel: Channel) {
+        val logo = runCatching { LogoResolver.resolve(channel, prefs, true) }.getOrNull()
+        when (logo) {
+            null -> showBottomLetter(channel)
+            is Int -> {
+                bottomLogo.setImageResource(logo)
+                bottomLogoLetter.visibility = View.GONE
+            }
+            else -> {
+                bottomLogoLetter.visibility = View.GONE
+                val request = ImageRequest.Builder(this)
+                    .data(logo.toString())
+                    .size(160, 96)
+                    .target(bottomLogo)
+                    .listener(object : ImageRequest.Listener {
+                        override fun onError(request: ImageRequest, result: ErrorResult) {
+                            showBottomLetter(channel)
+                        }
+                    })
+                    .build()
+                imageLoader.enqueue(request)
+            }
+        }
+    }
+
+    private fun showBottomLetter(channel: Channel) {
+        bottomLogo.setImageDrawable(null)
+        bottomLogoLetter.text = channel.name.trim().take(1).ifBlank { "TV" }
+        bottomLogoLetter.visibility = View.VISIBLE
+    }
+
+    /** 当前节目时间段 / 剩余 / 节目名 / 进度 / 下一个节目 */
+    private fun updateBottomProgram(channel: Channel? = currentChannel) {
+        val ch = channel ?: return
+        if (!::bottomRange.isInitialized) return
+        val now = epg.anchorNow()
+        val current = epg.current(ch)
+        val next = epg.upcoming(ch, 1).firstOrNull()
+
+        bottomRange.text = if (current != null) {
+            val left = ((current.stop - now) / 60_000L).coerceAtLeast(0)
+            "${current.timeRange()}  ·  剩 ${left} 分钟"
+        } else "暂无节目单"
+        bottomProgram.text = current?.title ?: next?.let { "即将  ${it.title}" } ?: "—"
+
+        val pct = current?.let { epg.progressPercent(it) } ?: 0
+        bottomProgress.progress = pct
+        bottomProgressText.text = if (current != null) "已播 $pct%" else ""
+
+        val nextLine = next?.let { "接下来  ${it.timeRange()}  ${it.title}" }.orEmpty()
+        bottomNext.visibility = if (nextLine.isBlank()) View.GONE else View.VISIBLE
+        bottomNext.text = nextLine
+    }
+
+    /** 按钮文字直接显示当前状态：收藏星标、线路、画质、播放状态、内核 */
+    private fun refreshBottomButtons(channel: Channel? = currentChannel) {
+        val ch = channel ?: return
+        if (!::btnLine.isInitialized) return
+        val fav = prefs.isFavorite(ch.stableKey())
+        btnFav.text = if (fav) "★ 已收藏" else "☆ 收藏"
+        btnFav.setTextColor(
+            ContextCompat.getColorStateList(
+                this,
+                if (fav) R.color.bottom_fav_text else R.color.bottom_button_text
+            ) ?: ColorStateList.valueOf(Color.WHITE)
+        )
+        val urls = ch.allUrls()
+        val idx = prefs.lineIndexFor(ch.stableKey())
+            .coerceIn(0, (urls.size - 1).coerceAtLeast(0))
+        btnLine.text = "线路 ${idx + 1}/${urls.size}"
+        btnQuality.text = "画质 " + Prefs.QUALITY_LABELS
+            .getOrElse(prefs.quality) { "自动" }.take(6)
+        val playing = ::player.isInitialized && player.isPlaying
+        btnControl.text = if (playing) "暂停" else "继续"
+        btnControl.setCompoundDrawablesWithIntrinsicBounds(
+            if (playing) R.drawable.ic_flat_pause else R.drawable.ic_flat_play, 0, 0, 0
+        )
+        val engine = Prefs.ENGINE_LABELS.getOrElse(prefs.engine) { "内置" }
+        btnEngine.text = "内核 " + when {
+            engine.contains("加速") -> "加速"
+            engine.contains("标准") -> "标准"
+            engine.contains("VLC") -> "VLC"
+            engine.contains("MX") -> "MX"
+            engine.contains("Kodi") -> "Kodi"
+            else -> "系统"
+        }
+    }
+
+    /** 换台 / 手动 MENU / 任意遥控器操作都重置 5 秒倒计时，静止 5 秒三处信息一起消失 */
+    private fun scheduleInfoHide() {
+        handler.removeCallbacks(hideInfoCardRunnable)
+        handler.postDelayed(hideInfoCardRunnable, INFO_HIDE_DELAY)
+    }
+
+    /** 控制条统一收起；手动模式自动超时时把焦点还给播放器 */
+    private fun hideTransientInfo() {
+        handler.removeCallbacks(hideInfoCardRunnable)
+        val wasManual = manualBottomMode
+        clearManualBottomMode()
+        hintView.visibility = View.GONE
+        if (::playerControls.isInitialized) playerControls.visibility = View.GONE
+        if (::channelInfoCard.isInitialized) channelInfoCard.visibility = View.GONE
+        if (::bottomInfoBar.isInitialized) bottomInfoBar.visibility = View.GONE
+        if (wasManual && mode == MODE_PLAYER) playerView.requestFocus()
+    }
+
+    private fun bottomActionButtons(): List<View> =
+        listOf(btnFav, btnGuide, btnLine, btnQuality, btnControl, btnEngine, btnSettings, btnClear)
+
+    /** 手动模式下用 isSelected 高亮当前功能，不依赖系统焦点，盒子遥控器一定可选 */
+    private fun applyBottomSelection() {
+        if (!::btnLine.isInitialized) return
+        bottomActionButtons().forEachIndexed { i, v -> v.isSelected = i == bottomActionIndex }
+    }
+
+    private fun clearBottomSelection() {
+        if (!::btnLine.isInitialized) return
+        bottomActionButtons().forEach { it.isSelected = false }
+    }
+
+    private fun clearManualBottomMode() {
+        manualBottomMode = false
+        clearBottomSelection()
+    }
+
+    /** 短按 MENU：呼出底部信息栏并进入「手动操作模式」，上下左右都能选功能 */
+    private fun onMenuShortPress() {
+        cancelNumberInput()
+        if (!::bottomInfoBar.isInitialized) return
+        // 墙面模式不弹右下 / 底部半透明浮层：3 行卡片必须完整可见、不被遮挡。
+        // 播放态仍保持原来的「短按 MENU 呼出底部信息栏并可遥控器操作」。
+        if (mode == MODE_WALL) {
+            if (channelAdapter.isSelectionMode()) {
+                exitRecentSelection()
+            } else {
+                toast("左右滑换台　·　双击暂停　·　点设置调整　·　单击显隐控制条")
+            }
+            return
+        }
+        if (epgVisible) hideEpg()
+        // 已处于手动模式时，再短按一次 MENU 收起信息栏
+        if (manualBottomMode && bottomInfoBar.visibility == View.VISIBLE) {
+            hideBottomBarForRemote()
+            return
+        }
+        val ch = currentChannel ?: focusedChannel() ?: allChannels.firstOrNull()
+        if (ch == null) {
+            toast("还没有频道　·　点右上角「设置」添加播放源")
+            return
+        }
+        // 手动 MENU 把三处信息一起重新呼出（自动消失后只有手动 MENU / 下次换台能再显示）
+        showChannelInfo(ch)
+        manualBottomMode = true
+        // 默认落在「线路」；按按钮对象查找，之后增删按钮也不会错位
+        bottomActionIndex = bottomActionButtons().indexOf(btnLine).coerceAtLeast(0)
+        bottomInfoBar.post {
+            if (bottomInfoBar.visibility == View.VISIBLE) {
+                applyBottomSelection()
+                scheduleInfoHide()
+            }
+        }
+        toast("点按选择　·　返回键收起　·　设置里可调整播放参数")
+    }
+
+    /** 手动模式下的按键分发：返回 true 表示已被信息栏消费 */
+    private fun handleManualBottomKey(keyCode: Int, event: KeyEvent?): Boolean {
+        // 节目单已打开时手动模式一律让位：方向键/OK 交回 EPG 选台逻辑，
+        // 避免用户在节目单里选了 15 台，按键却仍被底部栏吃掉。
+        if (epgVisible) {
+            clearManualBottomMode()
+            return false
+        }
+        if (!manualBottomMode || !::bottomInfoBar.isInitialized ||
+            bottomInfoBar.visibility != View.VISIBLE
+        ) return false
+        val fresh = event == null || event.repeatCount == 0
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_UP -> {
+                if (fresh) moveManualSelection(-1)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                if (fresh) moveManualSelection(1)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                if (fresh) runManualBottomAction()
+                return true
+            }
+            KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
+                hideBottomBarForRemote()
+                return true
+            }
+            // MENU 交给长短按逻辑：再短按一次收起，长按 3 秒进设置
+            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_SETTINGS -> return false
+        }
+        // 其它按键（换台 / 数字 / GUIDE 等）退出手动模式，交回原有快捷键逻辑
+        clearManualBottomMode()
+        return false
+    }
+
+    /** 上下左右都在 8 个功能间环形移动（上一个 / 下一个） */
+    private fun moveManualSelection(delta: Int) {
+        val n = bottomActionButtons().size
+        bottomActionIndex = (bottomActionIndex + delta + n) % n
+        applyBottomSelection()
+        scheduleInfoHide()
+    }
+
+    /**
+     * OK 只执行当前高亮的那一个功能。执行完立刻退出手动模式：
+     * 线路 / 画质 / 内核会弹出选择对话框，节目单 / 设置会切界面，
+     * 若继续保持手动模式，这些界面里的方向键和 OK 仍会被底部栏抢走。
+     * 想连续操作再短按一次 MENU 即可（会保留上次高亮位置）。
+     */
+    private fun runManualBottomAction() {
+        val i = bottomActionIndex
+        val btn = bottomActionButtons().getOrNull(i) ?: return
+        clearManualBottomMode()
+        btn.performClick()
+        scheduleInfoHide()
+    }
+
+    /** 收起底部信息栏并把焦点还给播放器 / 频道墙 */
+    private fun hideBottomBarForRemote() {
+        hideTransientInfo()
+        if (mode == MODE_PLAYER) playerView.requestFocus() else focusCurrentCard()
+    }
+
+    private fun setupBottomActions() {
+        btnFav.setOnClickListener {
+            (currentChannel ?: focusedChannel())?.let { toggleFavorite(it) }
+            scheduleInfoHide()
+        }
+        btnGuide.setOnClickListener { showEpg() }
+        btnLine.setOnClickListener { pickBottomLine() }
+        btnQuality.setOnClickListener { pickBottomQuality() }
+        btnControl.setOnClickListener {
+            togglePlayback()
+            refreshBottomButtons()
+            scheduleInfoHide()
+        }
+        btnEngine.setOnClickListener { pickBottomEngine() }
+        btnSettings.setOnClickListener { openSettings() }
+        btnClear.setOnClickListener { clearBottomCaches() }
+
+        // 遥控器在按钮间移动时重置隐藏计时，避免还没选完信息栏就消失
+        val reset = View.OnFocusChangeListener { _, hasFocus ->
+            if (hasFocus) scheduleInfoHide()
+        }
+        val buttons = bottomActionButtons()
+        buttons.forEachIndexed { i, v ->
+            v.onFocusChangeListener = reset
+            // 焦点闭环：即便系统自行做焦点搜索，也只会在这排按钮里移动
+            v.nextFocusLeftId = buttons[(i - 1 + buttons.size) % buttons.size].id
+            v.nextFocusRightId = buttons[(i + 1) % buttons.size].id
+            v.nextFocusUpId = v.id
+            v.nextFocusDownId = v.id
+        }
+    }
+
+    // ------------------------------------------------------------ 手机/平板标准控制条
+
+    /** 控制条按钮绑定：所有按钮直接响应点击，点击后统一重置自动收起倒计时 */
+    private fun setupPlayerControls() {
+        findViewById<View>(R.id.ctrlBack).setOnClickListener { exitPlayerMode() }
+        findViewById<View>(R.id.ctrlSettings).setOnClickListener {
+            showPlayerSettingsMenu()
+            scheduleInfoHide()
+        }
+        findViewById<View>(R.id.ctrlPrev).setOnClickListener {
+            playNeighbor(-1)
+            scheduleInfoHide()
+        }
+        findViewById<View>(R.id.ctrlNext).setOnClickListener {
+            playNeighbor(1)
+            scheduleInfoHide()
+        }
+        ctrlPlayPause.setOnClickListener {
+            togglePlayback()
+            refreshCtrlPlayPause()
+            scheduleInfoHide()
+        }
+        // 关键修复：绝不能给这些按钮挂「返回 true」的 OnTouchListener。
+        // TouchGestures 只监听 playerView，控制条是它的兄弟视图，点按钮不会误触画面显隐；
+        // 若 OnTouchListener 吞掉 ACTION_DOWN，OnClickListener 永远不会回调（按钮点了没反应）。
+    }
+
+    /** 播放/暂停图标随状态切换 */
+    private fun refreshCtrlPlayPause() {
+        if (!::ctrlPlayPause.isInitialized) return
+        val playing = ::player.isInitialized && player.isPlaying
+        ctrlPlayPause.text = if (playing) "⏸" else "▶"
+    }
+
+    /**
+     * 原底部 8 项功能收进「设置」弹出的常规菜单（手机/平板习惯）。
+     * 每个入口复用既有动作方法，行为与 TV 版完全一致。
+     */
+    private fun showPlayerSettingsMenu() {
+        val ch = currentChannel
+        val fav = ch?.let { prefs.isFavorite(it.stableKey()) } ?: false
+        val items = arrayOf(
+            if (fav) "★ 取消收藏" else "☆ 收藏频道",
+            "▤ 节目单",
+            "⇄ 切换线路",
+            "◈ 画质 / 分辨率",
+            if (::player.isInitialized && player.isPlaying) "⏸ 暂停播放" else "▶ 继续播放",
+            "⚙ 播放器内核",
+            "⚙ 应用设置",
+            "🧹 清理缓存"
+        )
+        AlertDialog.Builder(this)
+            .setTitle(if (ch != null) "播放设置 · ${ch.name}" else "播放设置")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> ch?.let { toggleFavorite(it) }
+                    1 -> showEpg()
+                    2 -> pickBottomLine()
+                    3 -> pickBottomQuality()
+                    4 -> { togglePlayback(); refreshCtrlPlayPause() }
+                    5 -> pickBottomEngine()
+                    6 -> openSettings()
+                    7 -> clearBottomCaches()
+                }
+                scheduleInfoHide()
+            }
+            .setNegativeButton("关闭", null)
+            .showFitting()
+    }
+
+    /** 选线路后立即用所选线路重新起播当前频道 */
+    private fun pickBottomLine() {
+        val ch = currentChannel ?: return
+        val lines = ch.lines()
+        if (lines.isEmpty()) return
+        val labels = lines.mapIndexed { i, line ->
+            val mark = if (i == currentLineIndex) "● " else "   "
+            val host = runCatching { Uri.parse(line.first).host.orEmpty() }.getOrDefault("")
+            "$mark${i + 1}. ${ch.lineLabel(i)}" + if (host.isNotBlank()) "  $host" else ""
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("选择线路 · ${ch.name}")
+            .setItems(labels) { _, which ->
+                currentLineIndex = which
+                prefs.setLineIndex(ch.stableKey(), which)
+                startPlayback(ch)
+                showBottomInfo(ch)
+                toast("已切换 ${ch.lineLabel(which)}（${which + 1}/${lines.size}）")
+            }
+            .setNegativeButton("取消", null)
+            .showFitting()
+    }
+
+    /** 选分辨率后立即应用到轨道选择器，当前画面即时生效 */
+    private fun pickBottomQuality() {
+        AlertDialog.Builder(this)
+            .setTitle("分辨率 / 画质")
+            .setSingleChoiceItems(
+                Prefs.QUALITY_LABELS.toTypedArray(), prefs.quality
+            ) { dialog, which ->
+                prefs.quality = which
+                applyTrackParameters()
+                refreshBottomButtons()
+                toast("已切换：${Prefs.QUALITY_LABELS[which]}")
+                scheduleInfoHide()
+                dialog.dismiss()
+            }
+            .setNegativeButton("取消", null)
+            .showFitting()
+    }
+
+    /** 选播放器内核后重新起播：内置内核换缓冲策略，外部内核直接拉起对应播放器 */
+    private fun pickBottomEngine() {
+        AlertDialog.Builder(this)
+            .setTitle("播放器内核")
+            .setSingleChoiceItems(
+                Prefs.ENGINE_LABELS.toTypedArray(), prefs.engine
+            ) { dialog, which ->
+                prefs.engine = which
+                currentChannel?.let { playChannel(it, enterPlayer = false) }
+                refreshBottomButtons()
+                toast("已切换：${Prefs.ENGINE_LABELS[which]}，正在重新起播")
+                scheduleInfoHide()
+                dialog.dismiss()
+            }
+            .setNegativeButton("取消", null)
+            .showFitting()
+    }
+
+    private fun clearBottomCaches() {
+        runCatching {
+            imageLoader.memoryCache?.clear()
+            imageLoader.diskCache?.clear()
+        }
+        previewFailedUrls.clear()
+        toast("台标与预览缓存已清理")
+        scheduleInfoHide()
+    }
+
+    private fun loadEpgInBackground(force: Boolean = false) {
+        if (epgLoading) return
+        epgLoading = true
+        lastEpgAttempt = System.currentTimeMillis()
+        ioExecutor.execute {
+            runCatching { epg.load(force) }
+            runOnUiThread {
+                epgLoading = false
+                if (epgVisible) {
+                    epgTitleView.text = if (epg.isLoaded) "节目单 · XMLTV" else "节目单 · 频道清单"
+                    epgAdapter.refreshGuide()
+                    updateEpgDetail()
+                }
+                updateInfoProgram()
+                // 加载失败时给出明确提示（去重，避免反复弹），方便盒子侧定位是网络还是地址问题
+                if (!epg.isLoaded && !epg.lastError.isNullOrBlank()) {
+                    val err = epg.lastError
+                    if (err != lastEpgErrorShown) {
+                        lastEpgErrorShown = err
+                        toast("节目单加载失败：$err　·　设置 → XMLTV 节目单检查地址")
+                    }
+                } else if (epg.isLoaded) {
+                    lastEpgErrorShown = null
+                }
+            }
+        }
+    }
+
+    /**
+     * 节目预约提醒：应用在前台时每分钟检查，开播前 1 分钟弹浮层，按 OK 直接跳台。
+     * 盒子多无通知栏 / 后台受限，因此用前台提醒，不依赖 AlarmManager。
+     */
+    private fun checkReservations() {
+        val keys = prefs.reservations
+        if (keys.isEmpty()) return
+        val now = System.currentTimeMillis()
+        for (key in keys) {
+            val start = key.substringAfterLast('|').toLongOrNull() ?: continue
+            if (start - now !in 0..60_000L) continue
+            if (lastReminderKey == key) continue
+            val channelKey = key.substringBeforeLast('|')
+            val channel = allChannels.firstOrNull { it.stableKey() == channelKey } ?: continue
+            lastReminderKey = key
+            val title = epg.window(channel, start - 60_000L, start + 60_000L)
+                .firstOrNull()?.title ?: "预约节目"
+            reservationTarget = channelKey
+            reservationCard.text = buildString {
+                append("⏰ 预约提醒　").append(channel.name).append(" · ").append(title)
+                append("\n").append(Catchup.clock(start)).append(" 即将开始　按 OK 立即跳转")
+            }
+            reservationCard.visibility = View.VISIBLE
+            handler.removeCallbacks(hideReservationRunnable)
+            handler.postDelayed(hideReservationRunnable, 60_000L)
+            toast("⏰ 预约节目即将开始：${channel.name} $title")
+            // 一次性提醒，触发后从预约表移除，避免反复弹出
+            prefs.toggleReservation(key)
+            return
+        }
+    }
+
+    private fun showEpg() {
+        if (allChannels.isEmpty()) {
+            toast("还没有频道，点右上角「设置」添加播放源")
+            return
+        }
+        // 打开节目单前必须退出「手动 MENU 操作模式」并收起三处信息：
+        // 否则底部栏会继续抢走上下左右 / OK，节目单里的选台完全无效，
+        // 甚至会再次 showEpg() 把选中位置重置回当前频道。
+        clearManualBottomMode()
+        hideTransientInfo()
+        epgVisible = true
+        epgPanel.visibility = View.VISIBLE
+        epgTitleView.text = if (epg.isLoaded) "节目单 · XMLTV" else "节目单 · 频道清单"
+        val current = currentChannel
+        epgIndex = current?.let { c -> allChannels.indexOfFirst { it.url == c.url } }
+            ?.takeIf { it >= 0 } ?: 0
+        epgAdapter.submit(allChannels, epgIndex, current?.url)
+        epgTimeView.text = "当前时间  " +
+            SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+        epgListView.scrollToPosition(epgIndex)
+        updateEpgDetail()
+        if (prefs.epgUrl.isNotBlank()) loadEpgInBackground()
+    }
+
+    private fun hideEpg() {
+        epgVisible = false
+        epgPanel.visibility = View.GONE
+    }
+
+    private fun moveEpg(delta: Int) {
+        if (allChannels.isEmpty()) return
+        epgIndex = (epgIndex + delta).coerceIn(0, allChannels.size - 1)
+        epgAdapter.updateSelection(epgIndex, currentChannel?.url)
+        epgListView.scrollToPosition(epgIndex)
+        updateEpgDetail()
+    }
+
+    private fun updateEpgDetail() {
+        val channel = allChannels.getOrNull(epgIndex) ?: return
+        epgDetailView.text = "【${channel.name}】\n" + epg.detail(channel)
+    }
+
+    private fun pickEpgChannel(index: Int) {
+        val channel = allChannels.getOrNull(index) ?: return
+        hideEpg()
+        playChannel(channel)
+    }
+
+    private fun syncEpgToCurrent() {
+        val current = currentChannel ?: return
+        val index = allChannels.indexOfFirst { it.url == current.url }
+        if (index >= 0) {
+            epgIndex = index
+            epgAdapter.updateSelection(index, current.url)
+            epgListView.scrollToPosition(index)
+            updateEpgDetail()
+        }
+    }
+
+    private fun enterPlayerMode() {
+        mode = MODE_PLAYER
+        if (::touchGestures.isInitialized) touchGestures.enabled = true
+        stopPreview()
+        // 只有从墙面回来（playerView 曾被置 GONE、surface 已销毁）才需要解绑重绑 player
+        // 让 surface 重建出画；播放中换台走这里时 view 一直是 VISIBLE、surface 还在，
+        // 跳过重绑可避免一次黑屏闪烁与解码器重建，切台明显更顺滑。
+        val surfaceNeedsRebind = playerView.visibility != View.VISIBLE
+        playerView.visibility = View.VISIBLE
+        if (surfaceNeedsRebind || playerView.player !== player) {
+            playerView.player = null
+            playerView.player = player
+        }
+        wallLayer.visibility = View.GONE
+        // 兜底把主音量拉满：历史版本里预览小窗抢过音频焦点，ExoPlayer 会把主音量压到 0
+        player.volume = 1f
+        if (currentChannel != null && !userPaused) player.play()
+        showPlayerOverlay()
+    }
+
+    private fun exitPlayerMode() {
+        mode = MODE_WALL
+        if (::touchGestures.isInitialized) touchGestures.enabled = false
+        hideEpg()
+        if (::playerControls.isInitialized) playerControls.visibility = View.GONE
+        channelInfoCard.visibility = View.GONE
+        clearManualBottomMode()
+        bottomInfoBar.visibility = View.GONE
+        handler.removeCallbacks(hideInfoCardRunnable)
+        wallLayer.visibility = View.VISIBLE
+        // 回到墙面时确保顶部栏可见（可能之前滑动时被隐藏）
+        handler.removeCallbacks(showWallHeaderRunnable)
+        setWallHeaderHidden(false)
+        hintView.visibility = View.GONE
+        setPlaybackStatus(null)
+        errorView.visibility = View.GONE
+        // 关键性能修复：回到频道墙就暂停并把全屏 SurfaceView 置 GONE，
+        // 系统会销毁 surface 并释放硬件视频解码器，墙面滚动不再和直播抢资源
+        if (!prefs.backgroundPlay && currentChannel != null) {
+            player.pause()
+            playerView.visibility = View.GONE
+        }
+        updateNowPlayingChip()
+        buildGroups()
+        if (Library.isVirtual(activeGroup)) applyFilter(focusFirst = false)
+        focusCurrentCard()
+    }
+
+    private fun togglePlayback() {
+        if (player.isPlaying) {
+            userPaused = true
+            player.pause()
+            setPlaybackStatus("已暂停 · 按播放键继续")
+            showPlayerOverlay()
+        } else if (currentChannel != null) {
+            userPaused = false
+            player.play()
+            setPlaybackStatus(null)
+            showPlayerOverlay()
+        }
+    }
+
+    // ------------------------------------------------------------ 按键
+
+    private fun isOkKey(keyCode: Int): Boolean =
+        keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+            keyCode == KeyEvent.KEYCODE_ENTER ||
+            keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+
+    /** Activity 已在 down 消费掉这次按键时，连 up 也一并吞掉 */
+    private fun consumeOk(keyCode: Int): Boolean {
+        if (isOkKey(keyCode)) consumedOkDown = true
+        return true
+    }
+
+    /** MENU 抬键时若 3 秒长按还没触发，就执行短按：呼出底部信息栏 */
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_MENU || keyCode == KeyEvent.KEYCODE_SETTINGS) {
+            handler.removeCallbacks(menuLongPressRunnable)
+            if (!menuLongPressFired) onMenuShortPress()
+            menuLongPressFired = false
+            return true
+        }
+        // down 已被 Activity 处理的 OK，抬键绝不能再交给 framework：
+        // 否则它会对「当前持有焦点的 View」再触发一次 click，
+        // 旧版就是这样出现「按 OK 弹出节目单」「EPG 选 15 又跳回 13」的。
+        if (isOkKey(keyCode) && consumedOkDown) {
+            consumedOkDown = false
+            val showEpgOnUp = pendingShowEpgOnOkUp
+            val pickEpgOnUp = pendingPickEpgOnOkUp
+            pendingShowEpgOnOkUp = false
+            pendingPickEpgOnOkUp = false
+            if (pickEpgOnUp) pickEpgChannel(epgIndex) else if (showEpgOnUp) showEpg()
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // 每次 OK「首次」按下都从干净状态开始；repeat DOWN 不清标志，
+        // 否则长按时待执行的短按动作会被中途抹掉。
+        if (isOkKey(keyCode) && (event == null || event.repeatCount == 0)) {
+            consumedOkDown = false
+            pendingShowEpgOnOkUp = false
+            pendingPickEpgOnOkUp = false
+            okLongPressHandled = false
+        }
+
+        // 手动按过 MENU 后，上下左右 / OK / BACK 全部由底部信息栏接管；
+        // 非手动（换台自动显示）时这里直接放行，方向键保持换台 / 切线路。
+        if (handleManualBottomKey(keyCode, event)) return consumeOk(keyCode)
+
+        // 数字选台输入中：OK 立即跳转、DEL 退格、BACK 取消；
+        // 必须放在播放态快捷键之前，否则上下/左右/OK 会把输入过程抢走。
+        if (numberBuffer.isNotEmpty()) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_CLEAR -> {
+                    backspaceNumber()
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                    if (event == null || event.repeatCount == 0) commitNumber()
+                    return consumeOk(keyCode)
+                }
+                KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
+                    cancelNumberInput()
+                    return true
+                }
+            }
+        }
+        // MENU / SETTINGS：短按在 onKeyUp 里呼出底部信息栏，长按 3 秒才进设置中心。
+        // 放在播放态快捷键之前，避免按键被「左右切线路 / OK 节目单」抢走。
+        if (keyCode == KeyEvent.KEYCODE_MENU || keyCode == KeyEvent.KEYCODE_SETTINGS) {
+            if (!menuLongPressFired && (event == null || event.repeatCount == 0)) {
+                handler.removeCallbacks(menuLongPressRunnable)
+                handler.postDelayed(menuLongPressRunnable, MENU_LONG_PRESS_MS)
+            }
+            // 长按已触发后，后续重复按键全部吞掉，避免再排一次「打开设置」
+            return true
+        }
+        // 信息栏可见时，任何遥控器操作都算一次交互，重置 5 秒隐藏计时。
+        // 非手动模式不接管方向键：换台 / 切线路等原有快捷键保持不变。
+        if (::bottomInfoBar.isInitialized && bottomInfoBar.visibility == View.VISIBLE) {
+            scheduleInfoHide()
+        }
+        // 让 OK 键参与长按跟踪：长按 OK = 收藏当前频道（见 onKeyLongPress）
+        if (event != null && isOkKey(keyCode) && event.repeatCount == 0) {
+            event.startTracking()
+        }
+        // 长按兜底：不少盒子不发 framework 的 onKeyLongPress，只发连续 repeat。
+        // 用 downTime 判断按住时长，超过系统长按阈值就收藏一次，并撤销所有短按动作。
+        if (isOkKey(keyCode) && mode == MODE_PLAYER && !okLongPressHandled &&
+            event != null && (event.repeatCount >= 1 || event.isLongPress) &&
+            (event.isLongPress || event.eventTime - event.downTime >= longPressTimeoutMs())
+        ) {
+            okLongPressHandled = true
+            pendingShowEpgOnOkUp = false
+            pendingPickEpgOnOkUp = false
+            favoriteTargetForLongPress()?.let { toggleFavorite(it) }
+            return consumeOk(keyCode)
+        }
+        // 长按产生的重复 DOWN 一律吞掉，绝不落到「OK 打开节目单」等短按行为。
+        // 墙面模式除外：卡片长按收藏由 ChannelAdapter 自己的定时器处理。
+        if (isOkKey(keyCode) && event != null &&
+            (event.repeatCount >= 1 || event.isLongPress) &&
+            (mode == MODE_PLAYER || epgVisible)
+        ) {
+            return consumeOk(keyCode)
+        }
+        when (keyCode) {
+            KeyEvent.KEYCODE_BACK -> {
+                // 「最近观看」管理模式下 BACK 只退出多选，不退出页面
+                if (mode == MODE_WALL && channelAdapter.isSelectionMode()) {
+                    exitRecentSelection()
+                    return true
+                }
+                if (epgVisible) {
+                    hideEpg()
+                    return true
+                }
+                if (mode == MODE_PLAYER) {
+                    exitPlayerMode()
+                    return true
+                }
+            }
+            KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_MEDIA_NEXT -> {
+                playNeighbor(1)
+                return true
+            }
+            KeyEvent.KEYCODE_CHANNEL_DOWN, KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                playNeighbor(-1)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                if (epgVisible) {
+                    moveEpg(-1)
+                    return true
+                }
+                if (mode == MODE_PLAYER) {
+                    playNeighbor(1)
+                    return true
+                }
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                if (epgVisible) {
+                    moveEpg(1)
+                    return true
+                }
+                if (mode == MODE_PLAYER) {
+                    playNeighbor(-1)
+                    return true
+                }
+            }
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                togglePlayback()
+                return true
+            }
+            KeyEvent.KEYCODE_GUIDE, KeyEvent.KEYCODE_TV, KeyEvent.KEYCODE_INFO -> {
+                openEpgGrid()
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                if (mode == MODE_PLAYER && !epgVisible) {
+                    lineSwitches = 0
+                    switchLine(-1)
+                    return true
+                }
+                // 墙面移到一行最左边再按左键 → 上一页，焦点落到上一页最后一张卡
+                if (mode == MODE_WALL && tryEdgePage(-1)) return true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                if (mode == MODE_PLAYER && !epgVisible) {
+                    lineSwitches = 0
+                    switchLine(1)
+                    return true
+                }
+                // 墙面移到一行最右边（或本页最后一张卡）再按右键 → 下一页
+                if (mode == MODE_WALL && tryEdgePage(1)) return true
+            }
+            KeyEvent.KEYCODE_PAGE_UP -> {
+                if (mode == MODE_WALL) {
+                    goPage(currentPage - 1, focusLast = true)
+                    return true
+                }
+            }
+            KeyEvent.KEYCODE_PAGE_DOWN -> {
+                if (mode == MODE_WALL) {
+                    goPage(currentPage + 1)
+                    return true
+                }
+            }
+            KeyEvent.KEYCODE_MEDIA_REWIND, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
+                showTimeshiftMenu()
+                return true
+            }
+            // MENU / SETTINGS 已在上方统一处理：短按呼出底部信息栏，长按 3 秒进设置
+            KeyEvent.KEYCODE_BOOKMARK -> {
+                if (mode == MODE_WALL && channelAdapter.isSelectionMode()) {
+                    toast("管理记录中：OK 选择，退出后再收藏")
+                    return true
+                }
+                // 部分遥控器带收藏键：墙面直接收藏，EPG 面板收藏选中频道
+                val channel = if (epgVisible) {
+                    allChannels.getOrNull(epgIndex)
+                } else {
+                    focusedChannel()
+                }
+                channel?.let { toggleFavorite(it) }
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                // 长按的重复 DOWN 已在上一段吞掉，这里只处理短按 OK。
+                // 换源统一用底部信息栏「线路」按钮；长按 OK 改为收藏。
+                // 预约提醒浮层显示时，OK 直接跳到预约频道
+                val reserved = reservationTarget
+                if (reserved != null) {
+                    reservationTarget = null
+                    reservationCard.visibility = View.GONE
+                    handler.removeCallbacks(hideReservationRunnable)
+                    allChannels.firstOrNull { it.stableKey() == reserved }?.let {
+                        playChannel(it)
+                        return consumeOk(keyCode)
+                    }
+                }
+                when {
+                    epgVisible -> {
+                        // 等抬键再换台：长按时由收藏逻辑撤销，节目单不会消失、不会被换台。
+                        // 抬键同时被吞掉，列表行不会二次点击把频道覆盖回原台。
+                        pendingPickEpgOnOkUp = true
+                        return consumeOk(keyCode)
+                    }
+                    mode == MODE_PLAYER -> {
+                        // 延到抬键再打开：长按时由 onKeyLongPress 撤销并改成收藏
+                        pendingShowEpgOnOkUp = true
+                        return consumeOk(keyCode)
+                    }
+                    allChannels.isEmpty() -> {
+                        openSettings()
+                        return consumeOk(keyCode)
+                    }
+                }
+            }
+        }
+
+        val digit = when (keyCode) {
+            in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> keyCode - KeyEvent.KEYCODE_0
+            in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_9 -> keyCode - KeyEvent.KEYCODE_NUMPAD_0
+            else -> -1
+        }
+        if (digit >= 0) {
+            if (epgVisible) hideEpg()
+            handleDigit(digit)
+            return true
+        }
+
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyLongPress(keyCode: Int, event: KeyEvent?): Boolean {
+        // 长按 OK = 收藏：播放态收藏当前频道，节目单可见时收藏高亮频道。
+        // 撤销所有待执行的短按动作，节目单保持显示、不换台、不重开。
+        // 墙面由 ChannelAdapter 自己的长按定时器处理，这里不接管，防止重复 toggle。
+        if (isOkKey(keyCode) && mode == MODE_PLAYER && !okLongPressHandled) {
+            okLongPressHandled = true
+            pendingShowEpgOnOkUp = false
+            pendingPickEpgOnOkUp = false
+            favoriteTargetForLongPress()?.let {
+                toggleFavorite(it)
+                return true
+            }
+        }
+        return super.onKeyLongPress(keyCode, event)
+    }
+
+    private fun handleDigit(digit: Int) {
+        if (numberBuffer.length >= NUMBER_MAX_DIGITS) numberBuffer = ""
+        numberBuffer += digit.toString()
+        handler.removeCallbacks(commitNumberRunnable)
+        updateNumberInputUi()
+        handler.postDelayed(commitNumberRunnable, NUMBER_TIMEOUT)
+    }
+
+    /** 输入过程实时回显台号、精确命中的频道和前缀候选，电视上不再「盲按」 */
+    private fun updateNumberInputUi() {
+        if (!::numberInputCard.isInitialized) return
+        numberInputCard.visibility = View.VISIBLE
+        numberInputDigitsView.text = numberBuffer
+            .padEnd(NUMBER_MAX_DIGITS, '_')
+            .map { "$it " }
+            .joinToString("")
+            .trimEnd()
+
+        val exact = allChannels.firstOrNull { it.number.toString() == numberBuffer }
+        val candidates = allChannels.asSequence()
+            .filter { it.number.toString().startsWith(numberBuffer) }
+            .take(3)
+            .toList()
+            .joinToString("　") { "CH${it.number} ${it.name}" }
+        numberInputMatchView.text = when {
+            exact != null -> "▶ CH${exact.number}　${exact.name}"
+            candidates.isNotBlank() -> candidates
+            else -> "没有以 $numberBuffer 开头的频道"
+        }
+    }
+
+    private fun backspaceNumber() {
+        numberBuffer = numberBuffer.dropLast(1)
+        handler.removeCallbacks(commitNumberRunnable)
+        if (numberBuffer.isEmpty()) {
+            cancelNumberInput()
+            return
+        }
+        updateNumberInputUi()
+        handler.postDelayed(commitNumberRunnable, NUMBER_TIMEOUT)
+    }
+
+    private fun cancelNumberInput() {
+        numberBuffer = ""
+        handler.removeCallbacks(commitNumberRunnable)
+        if (::numberInputCard.isInitialized) numberInputCard.visibility = View.GONE
+    }
+
+    private fun commitNumber() {
+        val target = numberBuffer.toIntOrNull()
+        cancelNumberInput()
+        if (target == null || target <= 0) return
+        playByNumber(target)
+    }
+
+    // ------------------------------------------------------------ 设置入口
+
+    private var lastSettingsLaunch = 0L
+
+    private fun openSettings() {
+        // 长按期间部分盒子会连续发 MENU，防止叠开多个设置页导致「闪一下又回来」
+        val now = System.currentTimeMillis()
+        if (now - lastSettingsLaunch < 1200L) return
+        lastSettingsLaunch = now
+        startActivity(Intent(this, SettingsActivity::class.java))
+    }
+
+    /**
+     * adb / 深链一键导入：
+     *   am start -a android.intent.action.VIEW -d "https://x/all.m3u"
+     *   am start -a android.intent.action.VIEW -d "flysnow://import?url=https%3A%2F%2Fx%2Fall.txt"
+     * 带 method=POST / body / tokenUrl / fields 时仍走完整接口配置。
+     */
+    private fun handleIntent(intent: Intent?) {
+        val data = intent?.data ?: return
+        val headers = intent.getStringExtra("headers").orEmpty()
+        val fields = intent.getStringExtra("fields").orEmpty()
+        val body = intent.getStringExtra("body").orEmpty()
+        val tokenUrl = intent.getStringExtra("tokenUrl").orEmpty()
+        val advanced = intent.getStringExtra("method")?.equals("POST", true) == true ||
+            body.isNotBlank() || tokenUrl.isNotBlank() || fields.isNotBlank()
+
+        val raw = if (data.scheme.equals("flysnow", true)) {
+            data.getQueryParameter("url").orEmpty()
+        } else {
+            data.toString()
+        }
+        val urls = SubscriptionImporter.normalize(raw)
+        if (urls.isEmpty()) return
+
+        if (advanced) {
+            for (url in urls) {
+                repository.addSource(
+                    SourceConfig(
+                        url = url,
+                        headersText = headers,
+                        fieldsText = fields,
+                        method = intent.getStringExtra("method")?.takeIf { it.isNotBlank() } ?: "GET",
+                        body = body,
+                        tokenUrl = tokenUrl,
+                        tokenPath = intent.getStringExtra("tokenPath").orEmpty(),
+                        refreshMinutes = intent.getStringExtra("refresh")?.toIntOrNull() ?: 0
+                    )
+                )
+            }
+            prefs.notifySourceChanged()
+            toast("已添加 ${urls.size} 个接口")
+            reloadPlaylist()
+            return
+        }
+
+        val replace = data.getQueryParameter("replace") == "1" ||
+            intent.getBooleanExtra("replace", false)
+        toast("正在一键导入 ${urls.size} 个链接…")
+        ioExecutor.execute {
+            val items = SubscriptionImporter.import(
+                this, repository, urls.joinToString("\n"), replace, headers
+            )
+            val ok = items.count { it.ok }
+            runOnUiThread {
+                if (isFinishing) return@runOnUiThread
+                toast("一键导入：成功 $ok/${items.size} 个链接，共 ${items.sumOf { it.channels }} 个频道")
+                reloadPlaylist()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ UI 辅助
+
+    private fun updateNowPlayingChip() {
+        val channel = currentChannel
+        if (channel == null) {
+            nowPlayingChip.visibility = View.GONE
+        } else {
+            nowPlayingChip.text = "● 正在播放 · ${channel.name}"
+            nowPlayingChip.visibility = View.VISIBLE
+        }
+    }
+
+    /** 显示手机/平板标准控制条，并纳入统一 5 秒倒计时。
+     *  换台时传入 channel：此刻 currentChannel 还是上一个频道，不能读它。 */
+    private fun showPlayerOverlay(channel: Channel? = currentChannel) {
+        if (!::playerControls.isInitialized) return
+        channel?.let { fillPlayerControls(it) }
+        refreshCtrlPlayPause()
+        playerControls.visibility = View.VISIBLE
+        startNetSpeedUpdates()
+        scheduleInfoHide()
+    }
+
+    /** 把频道信息填进新控制条（顶部频道名/线路 + 底部当前节目/时间/进度） */
+    private fun fillPlayerControls(channel: Channel) {
+        val urls = channel.allUrls()
+        val lineIndex = prefs.lineIndexFor(channel.stableKey())
+            .coerceIn(0, (urls.size - 1).coerceAtLeast(0))
+        ctrlName.text = channel.name
+        ctrlMeta.text = buildString {
+            append("CH ").append(channel.number.toString().padStart(2, '0'))
+            channel.group?.takeIf { it.isNotBlank() }?.let { append("  ·  ").append(it) }
+            if (urls.size > 1) append("  ·  线路 ").append(lineIndex + 1).append("/").append(urls.size)
+        }
+        ctrlTime.text = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+        // 当前节目 / 进度沿用 EPG
+        val now = epg.anchorNow()
+        val current = epg.current(channel)
+        val next = epg.upcoming(channel, 1).firstOrNull()
+        ctrlProgram.text = current?.let {
+            val left = ((it.stop - now) / 60_000L).coerceAtLeast(0)
+            "${it.title}　剩 ${left} 分钟"
+        } ?: next?.let { "即将播出  ${it.title}" } ?: "暂无节目单"
+        ctrlProgress.progress = current?.let { epg.progressPercent(it) } ?: 0
+        ctrlDuration.text = current?.timeRange() ?: ""
+    }
+
+    /** 播放状态提示与元信息共用卡片里的同一行，避免叠加时挤高卡片 */
+    private fun setPlaybackStatus(text: String?) {
+        if (!::statusView.isInitialized) return
+        val show = !text.isNullOrBlank()
+        statusView.text = text.orEmpty()
+        statusView.visibility = if (show) View.VISIBLE else View.GONE
+        if (::infoMetaView.isInitialized) {
+            infoMetaView.visibility = if (show) View.GONE else View.VISIBLE
+        }
+    }
+
+    // ------------------------------------------------------------ 实时网速
+
+    /** 前台持续采样：既给信息卡显示，也作为清晰度/卡顿策略的带宽依据 */
+    private fun startNetSpeedUpdates() {
+        if (!::infoNetSpeedView.isInitialized || netSpeedRunning) return
+        netSpeedRunning = true
+        resetNetSpeedSample()
+        handler.removeCallbacks(netSpeedTick)
+        handler.postDelayed(netSpeedTick, NET_SPEED_INTERVAL)
+    }
+
+    private fun stopNetSpeedUpdates() {
+        netSpeedRunning = false
+        handler.removeCallbacks(netSpeedTick)
+        resetNetSpeedSample()
+        if (::infoNetSpeedView.isInitialized) infoNetSpeedView.text = "网速 —"
+    }
+
+    private fun resetNetSpeedSample() {
+        lastRxBytes = -1L
+        lastTotalRxBytes = -1L
+        lastRxSampleMs = 0L
+        smoothedBps = 0.0
+        peakBps = 0.0
+        netSpeedSamples = 0
+        uidRxZeroSamples = 0
+        useUidRx = true
+    }
+
+    /**
+     * 每秒取一次下行字节差值并做指数平滑。优先用本进程 UID 统计，
+     * 部分电视 ROM 的 UID 统计不含以太网 / WiFi（恒为 0），连续 2 秒检测到
+     * 全局流量在涨而 UID 没动就自动回退到全局下行统计。
+     */
+    private fun updateNetSpeed() {
+        val now = SystemClock.elapsedRealtime()
+        val total = runCatching { TrafficStats.getTotalRxBytes() }.getOrDefault(-1L)
+        val uid = runCatching { TrafficStats.getUidRxBytes(Process.myUid()) }.getOrDefault(-1L)
+        val rx = if (useUidRx && uid >= 0) uid else total
+
+        if (rx >= 0 && lastRxBytes >= 0 && now > lastRxSampleMs && rx >= lastRxBytes) {
+            val delta = rx - lastRxBytes
+            val totalDelta = if (total >= 0 && lastTotalRxBytes >= 0) total - lastTotalRxBytes else 0L
+            if (useUidRx && delta == 0L && totalDelta > 0 && ++uidRxZeroSamples >= 2) {
+                useUidRx = false
+                lastRxBytes = -1L
+                lastTotalRxBytes = total
+                lastRxSampleMs = 0L
+                smoothedBps = 0.0
+            } else {
+                if (delta > 0) uidRxZeroSamples = 0
+                val instant = delta * 1000.0 / (now - lastRxSampleMs)
+                smoothedBps = if (smoothedBps <= 0.0) instant else smoothedBps * 0.55 + instant * 0.45
+                if (smoothedBps > 0) {
+                    netSpeedSamples++
+                    // 峰值每秒只衰减 1%：码率被压低后测得的速率会跟着变小，
+                    // 记住历史峰值才能在带宽恢复后把清晰度升回去
+                    peakBps = maxOf(peakBps * 0.99, smoothedBps)
+                }
+            }
+        }
+        lastRxBytes = rx
+        lastTotalRxBytes = total
+        lastRxSampleMs = now
+
+        val speedText = "网速 " + formatNetSpeed(smoothedBps)
+        if (channelInfoCard.visibility == View.VISIBLE) {
+            infoNetSpeedView.text = speedText
+            infoTimeView.text = clockText()
+        }
+        if (bottomInfoBar.visibility == View.VISIBLE) bottomTime.text = clockText()
+    }
+
+    private fun formatNetSpeed(bytesPerSec: Double): String {
+        if (bytesPerSec < 1024.0) return "${bytesPerSec.toLong()} B/s"
+        val kb = bytesPerSec / 1024.0
+        return if (kb < 1024.0) String.format(Locale.getDefault(), "%.0f KB/s", kb)
+        else String.format(Locale.getDefault(), "%.1f MB/s", kb / 1024.0)
+    }
+
+    private fun metaOf(channel: Channel): String {
+        val parts = ArrayList<String>()
+        parts.add("#${channel.number}")
+        channel.group?.takeIf { it.isNotBlank() }?.let { parts.add(it) }
+        parts.add(hostOf(channel.url))
+        currentResolution?.let { parts.add(it) }
+        return parts.joinToString("   ·   ")
+    }
+
+    private fun updateMeta() {
+        val channel = currentChannel ?: return
+        infoMetaView.text = metaOf(channel)
+        updateInfoExtra()
+    }
+
+    private fun hostOf(url: String): String =
+        runCatching { Uri.parse(url).host.orEmpty() }.getOrDefault("").ifBlank { url }
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+}
