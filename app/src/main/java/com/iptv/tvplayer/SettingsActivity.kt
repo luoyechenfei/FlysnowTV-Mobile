@@ -173,12 +173,12 @@ class SettingsActivity : AppCompatActivity() {
 
         section("① 一键导入订阅链接　·　最常用")
         actionRow("粘贴链接，一键导入", "推荐 · 一条或多条订阅地址，自动识别格式") { showQuickImportDialog() }
-        actionRow("从剪贴板一键导入", "手机上复制链接，在盒子上按此行即可（需输入法支持粘贴）") {
+        actionRow("从剪贴板一键导入", "复制链接后按此行即可（需输入法支持粘贴）") {
             quickImportFromClipboard()
         }
 
-        section("手机扫码配置　·　推荐")
-        actionRow("打开二维码 / 启动配置页", "手机扫码 → 网页表单 → 一键保存到电视") {
+        section("扫码 / 局域网配置　·　推荐")
+        actionRow("打开二维码 / 启动配置页", "手机扫码 → 网页表单 → 一键保存到本机") {
             startActivity(Intent(this, QrConfigActivity::class.java))
         }
 
@@ -311,7 +311,7 @@ class SettingsActivity : AppCompatActivity() {
         ) { prefs.externalFallback = it == 0 }
 
         section("关于 / 反馈")
-        actionRow("关于 飞雪TV", "版本号、版权与项目主页") { showAboutDialog() }
+        actionRow("关于 飞雪TV 手机版", "版本号、版权与项目主页") { showAboutDialog() }
         actionRow("检测更新", "对比 GitHub Releases，支持一键在线更新") { checkForUpdate() }
         actionRow("版本发布页", "查看历史版本与更新日志") { openUrl(releasesUrl) }
         actionRow("日志上报反馈", "扫码 / 微信 / QQ 分享运行日志与崩溃记录") { showFeedbackDialog() }
@@ -653,7 +653,7 @@ class SettingsActivity : AppCompatActivity() {
                 "$path\n\n" +
                     "内容：设备 / TLS / 接口配置 / 每次拉取结果 / 播放错误 / 崩溃堆栈\n\n" +
                     "取回方式：\nadb pull \"$path\"\n" +
-                    "或在盒子文件管理器打开 Android/data/com.iptv.tvplayer/files/Download/"
+                    "或在手机文件管理器打开 Android/data/$packageName/files/Download/"
             )
             .setPositiveButton("完成", null)
             .showFitting()
@@ -1037,9 +1037,9 @@ class SettingsActivity : AppCompatActivity() {
     private fun showAboutDialog() {
         val version = runCatching {
             packageManager.getPackageInfo(packageName, 0).versionName
-        }.getOrNull().orEmpty().ifBlank { "1.9.6" }
+        }.getOrNull().orEmpty().ifBlank { "1.0.1-mobile" }
         val message = buildString {
-            append("飞雪TV　·　Android TV 直播播放器\n")
+            append("飞雪TV 手机版　·　Android 手机 / 平板直播播放器\n")
             append("版本 ").append(version).append("\n\n")
 
             append("【版权与授权】\n")
@@ -1052,7 +1052,7 @@ class SettingsActivity : AppCompatActivity() {
             append(repoUrl)
         }
         AlertDialog.Builder(this)
-            .setTitle("关于 飞雪TV")
+            .setTitle("关于 飞雪TV 手机版")
             .setMessage(message)
             .setPositiveButton("关闭", null)
             .setNeutralButton("打开项目主页") { _, _ -> openUrl(repoUrl) }
@@ -1070,7 +1070,7 @@ class SettingsActivity : AppCompatActivity() {
     private fun showFeedbackDialog() {
         val version = runCatching {
             packageManager.getPackageInfo(packageName, 0).versionName
-        }.getOrNull().orEmpty().ifBlank { "1.9.6" }
+        }.getOrNull().orEmpty().ifBlank { "1.0.1-mobile" }
 
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1196,10 +1196,10 @@ class SettingsActivity : AppCompatActivity() {
         val apkSize: Long
     )
 
-    private val repoUrl = "https://github.com/luoyechenfei/FlysnowTV"
-    private val releasesUrl = "https://github.com/luoyechenfei/FlysnowTV/releases"
-    private val latestApi = "https://api.github.com/repos/luoyechenfei/FlysnowTV/releases/latest"
-    private val updateFileName = "FlysnowTV-update.apk"
+    private val repoUrl = "https://github.com/luoyechenfei/FlysnowTV-Mobile"
+    private val releasesUrl = "https://github.com/luoyechenfei/FlysnowTV-Mobile/releases"
+    private val latestApi = "https://api.github.com/repos/luoyechenfei/FlysnowTV-Mobile/releases/latest"
+    private val updateFileName = "FlysnowTV-Mobile-update.apk"
     private var updateDownloadId = -1L
     private var downloadReceiverRegistered = false
     /** App 内下载进度对话框；后台线程只通过 runOnUiThread 更新这几个 View */
@@ -1243,18 +1243,10 @@ class SettingsActivity : AppCompatActivity() {
         downloadReceiverRegistered = true
     }
 
-    /** 检测更新：对比 GitHub Releases 最新 tag 与本机版本 */
+    /** 检测更新：对比手机版 GitHub Releases 最新 tag 与本机版本 */
     private fun checkForUpdate() {
-        // 手机版（.mobile）是独立于 TV 版的应用，TV 版 Release 的 APK 与本包不兼容，
-        // 不能在线覆盖安装。这里直接提示，避免误报「有新版本」后下载一个装不上的包。
-        if (packageName.endsWith(".mobile")) {
-            AlertDialog.Builder(this)
-                .setTitle("关于更新")
-                .setMessage("手机版（FlysnowTV-Mobile）与电视版是两个独立应用，版本互不通用。\n\n请到项目 Releases 页面手动下载手机版安装包更新：$repoUrl/releases")
-                .setPositiveButton("知道了", null)
-                .showFitting()
-            return
-        }
+        // 手机版有独立仓库与 Release（FlysnowTV-Mobile），latestApi 已指向手机版仓库，
+        // 下载的是 FlysnowTV-Mobile.apk，与本包同包名同证书，可直接在线覆盖更新。
         toast("正在检测更新…")
         Thread {
             val result = runCatching { fetchLatestRelease() }
@@ -1272,7 +1264,7 @@ class SettingsActivity : AppCompatActivity() {
             readTimeout = 15000
             instanceFollowRedirects = true
             setRequestProperty("Accept", "application/vnd.github+json")
-            setRequestProperty("User-Agent", "FlysnowTV-Android")
+            setRequestProperty("User-Agent", "FlysnowTV-Mobile-Android")
         }
         try {
             if (conn.responseCode != 200) {
@@ -1307,7 +1299,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun localVersion(): String =
         runCatching { packageManager.getPackageInfo(packageName, 0).versionName }
-            .getOrNull().orEmpty().ifBlank { "1.9.6" }
+            .getOrNull().orEmpty().ifBlank { "1.0.1-mobile" }
 
     /** 按数字段比较版本号：v1.9.1 > 1.9 > 1.8，1.10 > 1.9（支持三段版本号） */
     private fun isNewer(remote: String, local: String): Boolean {
@@ -1559,7 +1551,7 @@ class SettingsActivity : AppCompatActivity() {
                 connectTimeout = 15000
                 readTimeout = 30000
                 instanceFollowRedirects = false
-                setRequestProperty("User-Agent", "FlysnowTV-Android")
+                setRequestProperty("User-Agent", "FlysnowTV-Mobile-Android")
                 setRequestProperty("Accept", "*/*")
                 // 禁止自动 gzip：否则 Content-Length 是压缩后长度，落盘字节数会对不上，
                 // 导致「文件不完整」误判（APK 本身已是压缩包，无需再压）
